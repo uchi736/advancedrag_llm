@@ -1,0 +1,47 @@
+# 環境変数ファイル
+.env
+.env.local
+
+# Pythonの仮想環境ディレクトリ
+myenv/
+venv/
+.venv/
+env/
+
+# その他の一般的な除外項目
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+*.sqlite
+*.db
+.DS_Store
+NUL
+
+# データベース関連
+*.sql
+chroma_db/
+chroma_jargon_db/
+
+# 出力ディレクトリ
+output/
+uploads/
+temp/
+
+# 実行結果ファイル
+data/bulk_query_results.csv
+
+# IDE設定
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# キャッシュ
+.cache/
+*.egg-info/

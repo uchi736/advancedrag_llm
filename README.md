@@ -2,36 +2,32 @@
 
 ## 概要
 
-LLMベースのシンプルな専門用語抽出を実装した次世代RAG（Retrieval-Augmented Generation）システムです。Azure OpenAI Serviceを活用し、Streamlitベースの直感的なUIで、日本語・英語の専門文書に対する強力な情報検索と質問応答を実現します。
+LLMベースの専門用語抽出による辞書機能を実装したRAGA
 
 ### 🌟 主要な特徴
 
-- **LLMベース専門用語抽出**: gpt-4o-miniを使用した4ステージの用語抽出プロセス
-- **ハイブリッド検索**: PGVectorベクトル検索とPostgreSQL全文検索を組み合わせた高精度検索
-- **専門用語クエリ拡張**: LLMを使用した検索クエリの最適化
-- **RAG定義生成**: ベクトル検索とLLMによる高品質な用語定義の自動生成
-- **類義語自動検出**: 候補プールから関連語を検出（文書内の語句のみ）
-- **Azure統合**: Azure OpenAI ServiceとAzure Document Intelligenceによる高度なPDF処理
-- **直感的UI**: Streamlitベースのタブ構成インターフェース
+- **LLMベース専門用語抽出**: LLMを使用した4ステージの用語抽出プロセス
+- **ハイブリッド検索**: PGVectorベクトル検索とPostgreSQL全文検索
+- **専門用語クエリ拡張**:専門用語辞書によりクエリを拡張
+- **RAG定義生成**: LLMによる用語定義の自動生成
+- **類義語自動検出**: 候補プールから関連語を検出
 
 ## 📚 専門用語抽出フロー
 
-シンプルで効果的な4ステージ処理:
+LLMによる4段階処理:
 
 ### Stage 1: 候補抽出（緩めに）
 - LLMが文書から専門用語候補を広く抽出
 - 定義は不要、用語名のみを収集
-- 信頼度スコアを付与（0.0-1.0）
 
 ### Stage 2: 技術用語フィルタリング
 - 候補から真の専門用語のみを選別
 - 一般的すぎる語（「システム」「処理」など）を除外
-- 除外された語も類義語候補として保持
+- 除外された語も類義語候補として保持👈専門用語ではない類義語を拾うため
 
 ### Stage 3: RAGベース定義生成
 - 専門用語に対してベクトルストアから関連文書を検索
 - LLMが検索結果を基に定義を生成
-- 文書に基づいた正確で簡潔な定義
 
 ### Stage 4: 類義語検出
 - 候補プール全体から類義語・関連語を検出
@@ -88,15 +84,9 @@ sequenceDiagram
 
 ### 専門用語処理
 - **LLMベース抽出**: 統計手法不要のシンプルな実装
-- **4ステージ処理**: 候補抽出 → フィルタリング → 定義生成 → 類義語検出
+- **4段階処理**: 候補抽出 → フィルタリング → 定義生成 → 類義語検出
 - **RAG定義生成**: ベクトル検索 + LLMによる高品質な定義
 - **類義語検出**: 文書内の語句のみを使用（LLMの一般知識を排除）
-
-### その他の機能
-- **Text-to-SQL**: 自然言語クエリを自動的にSQLに変換
-- **Azure Document Intelligence**: PDFの高精度処理とMarkdown出力
-- **評価システム**: Recall、Precision、MRR、nDCG、Hit Rateなどの定量評価
-- **用語辞書管理**: 抽出された専門用語の登録・検索・削除
 
 ### RAGクエリフローのシーケンス図
 
@@ -106,7 +96,7 @@ sequenceDiagram
     participant UI as Streamlit UI
     participant RAG as RAGSystem
     participant JM as JargonManager
-    participant LLM as GPT-4o-mini
+    participant LLM as LLM
     participant VS as Vector Store
     participant Ret as Retriever
 
@@ -166,7 +156,7 @@ graph TB
     end
 
     subgraph "LLMサービス"
-        LLM[Azure OpenAI<br/>gpt-4o-mini]
+        LLM[Azure OpenAI<br/>LLM]
         EMB[Azure OpenAI<br/>text-embedding-3-small]
         DI[Azure Document<br/>Intelligence]
     end
@@ -227,7 +217,7 @@ graph TB
 │   │   ├── ingestion.py        # ドキュメント取り込み処理
 │   │   ├── evaluator.py        # 評価システム
 │   │   ├── text_processor.py   # テキスト処理
-│   │   ├── sql_handler.py      # Text-to-SQL機能
+│   │   ├── sql_handler.py      # ドキュメントチャンク取得用SQLハンドラー
 │   │   └── pdf_processors/     # PDF処理モジュール
 │   ├── ui/                     # Streamlit UIモジュール
 │   │   ├── chat_tab.py         # チャットインターフェース
@@ -246,36 +236,20 @@ graph TB
 
 ## セットアップ
 
-### 1. 前提条件
-
-- Python 3.10以上
-- PostgreSQL 15以上（pgvector拡張機能が必要）
-- Azure OpenAI Service（gpt-4o-mini, text-embedding-3-small）
-- Azure Document Intelligence（オプション：PDF処理用）
-
-### 2. リポジトリのクローン
-
-```bash
-git clone <repository-url>
-cd advancedrag_llm
-```
-
-### 3. 仮想環境の作成
+### 1. 仮想環境の作成
 
 ```bash
 python -m venv myenv
-source myenv/bin/activate  # Linux/Mac
-# または
 myenv\Scripts\activate  # Windows
 ```
 
-### 4. 依存関係のインストール
+### 2. 依存関係のインストール
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 5. PostgreSQLとpgvectorのセットアップ
+### 3. PostgreSQLとpgvectorのセットアップ👈aws上のposgre利用しているため実行不要(なはず)
 
 ```sql
 -- pgvector拡張機能を有効化
@@ -297,15 +271,9 @@ CREATE TABLE IF NOT EXISTS jargon_dictionary (
 -- ベクトルストア用テーブルはLangChainが自動作成します
 ```
 
-### 6. 環境変数の設定
+### 4. 環境変数の設定
 
-`.env.example`を`.env`にコピーして設定:
-
-```bash
-cp .env.example .env
-```
-
-`.env`ファイルを編集:
+`.env`ファイル:
 
 ```env
 # Database
@@ -318,15 +286,15 @@ DB_PASSWORD=your-password
 # Azure OpenAI
 AZURE_OPENAI_API_KEY=your-api-key
 AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com
-AZURE_OPENAI_CHAT_DEPLOYMENT_NAME=gpt-4o-mini
+AZURE_OPENAI_CHAT_DEPLOYMENT_NAME=gpt-4o
 AZURE_OPENAI_EMBEDDING_DEPLOYMENT_NAME=text-embedding-3-small
 
-# Azure Document Intelligence (Optional)
+# Azure Document Intelligence
 AZURE_DI_ENDPOINT=https://your-di-resource.cognitiveservices.azure.com/
 AZURE_DI_API_KEY=your-di-api-key
 ```
 
-### 7. アプリケーションの起動
+### 5. アプリケーションの起動
 
 ```bash
 streamlit run app.py
@@ -355,22 +323,13 @@ streamlit run app.py
 2. 高度なRAG設定（オプション）:
    - クエリ拡張: 質問を自動拡張
    - RAG-Fusion: 複数クエリ + RRF
-   - 専門用語で補強: 用語辞書を使用
+   - 専門用語で補強: 用語辞書を使用👈検証で使うのはこれ
    - LLMリランク: 検索結果の再ランキング
 3. 質問を入力して送信
 
-### 4. 評価
+### 4. 評価👈検索精度の評価機能のみ
 
 1. 「🎯 Evaluation」タブを開く
 2. CSVファイルで評価データをアップロード
 3. バルククエリを実行
 4. Recall、Precision、MRRなどの指標を確認
-
-## 技術スタック
-
-- **フレームワーク**: Streamlit, LangChain
-- **LLM**: Azure OpenAI (gpt-4o-mini)
-- **Embeddings**: Azure OpenAI (text-embedding-3-small)
-- **ベクトルDB**: PostgreSQL + pgvector
-- **PDF処理**: Azure Document Intelligence
-- **言語**: Python 3.10+

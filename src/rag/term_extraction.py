@@ -322,19 +322,24 @@ class TermExtractor:
 
     async def _extract_terms(self, text: str) -> List[Dict[str, Any]]:
         """テキストから専門用語を抽出（2段階処理）"""
+        import asyncio
+        from tqdm import tqdm
+
         chunk_size = getattr(self.config, 'llm_extraction_chunk_size', 3000)
 
         # テキストをチャンクに分割
         chunks = self._split_text(text, chunk_size)
 
-        # ========== 第1段階: 緩い候補抽出 ==========
-        all_candidates = []
+        # ========== 第1段階: 緩い候補抽出（並列処理） ==========
+        logger.info(f"Stage 1: Extracting candidates from {len(chunks)} chunks (parallel)")
+        print(f"\n[Stage 1] チャンクから候補抽出中 ({len(chunks)}個のチャンク)...")
 
-        for i, chunk in enumerate(chunks, 1):
-            logger.info(f"Stage 1: Extracting candidates from chunk {i}/{len(chunks)}")
+        all_candidates = []
+        chain = self.candidate_extraction_prompt | self.llm | self.json_parser
+
+        async def extract_from_chunk(i: int, chunk: str):
+            """1つのチャンクから候補を抽出"""
             try:
-                # 候補抽出プロンプトの実行
-                chain = self.candidate_extraction_prompt | self.llm | self.json_parser
                 result = await chain.ainvoke({
                     "text": chunk,
                     "format_instructions": self.json_parser.get_format_instructions()
@@ -349,6 +354,7 @@ class TermExtractor:
                     candidates = []
 
                 # 辞書形式に変換
+                chunk_candidates = []
                 for candidate in candidates:
                     if hasattr(candidate, "dict"):
                         cand_dict = candidate.dict()
@@ -361,36 +367,56 @@ class TermExtractor:
                     if "term" in cand_dict:
                         cand_dict["headword"] = cand_dict.pop("term")
 
-                    all_candidates.append(cand_dict)
+                    chunk_candidates.append(cand_dict)
+
+                return chunk_candidates
 
             except Exception as e:
-                logger.error(f"Error in candidate extraction for chunk {i}: {e}")
+                logger.error(f"Error in candidate extraction for chunk {i+1}: {e}")
+                return []
+
+        # 並列実行（プログレスバー付き）
+        tasks = [extract_from_chunk(i, chunk) for i, chunk in enumerate(chunks)]
+
+        with tqdm(total=len(tasks), desc="候補抽出", unit="chunk", ncols=80) as pbar:
+            for coro in asyncio.as_completed(tasks):
+                chunk_candidates = await coro
+                all_candidates.extend(chunk_candidates)
+                pbar.update(1)
 
         # 候補の重複除去
         unique_candidates = self._merge_duplicates(all_candidates)
         logger.info(f"Stage 1 complete: {len(unique_candidates)} unique candidates extracted")
+        print(f"✓ {len(unique_candidates)}個の候補を抽出しました\n")
 
         # ========== 第2段階: 専門用語の選別 ==========
         technical_terms = []
 
         if unique_candidates:
             logger.info("Stage 2: Filtering technical terms from candidates")
+            print(f"[Stage 2] 専門用語を選別中...")
             technical_terms = await self._filter_technical_terms(unique_candidates)
             logger.info(f"Stage 2 complete: {len(technical_terms)} technical terms selected")
+            print(f"✓ {len(technical_terms)}個の専門用語を選別しました\n")
 
         # ========== 第3段階: RAGベースの定義生成（専門用語のみ） ==========
         if technical_terms and self.vector_store:
             logger.info("Stage 3: Generating definitions using RAG for technical terms")
+            print(f"[Stage 3] 定義を生成中 ({len(technical_terms)}個の専門用語)...")
             technical_terms = await self._generate_definitions_with_rag(technical_terms)
+            print(f"✓ 定義生成が完了しました\n")
         else:
             logger.info("Stage 3: Skipping definition generation (no vector store)")
+            print(f"[Stage 3] ベクトルストアがないため定義生成をスキップします\n")
 
         # ========== 第4段階: 類義語検出（候補プール全体を使用） ==========
         if technical_terms and unique_candidates:
             logger.info("Stage 4: Detecting synonyms using full candidate pool")
+            print(f"[Stage 4] 類義語を検出中...")
             technical_terms = await self._detect_synonyms_with_candidates(
                 technical_terms, unique_candidates
             )
+            print(f"✓ 類義語検出が完了しました\n")
 
         # 候補プールも返却用データに含める
         for term in technical_terms:
@@ -503,7 +529,10 @@ class TermExtractor:
             return candidates  # エラー時は全候補を返す
 
     async def _generate_definitions_with_rag(self, technical_terms: List[Dict]) -> List[Dict]:
-        """RAGを使用して専門用語の定義を生成"""
+        """RAGを使用して専門用語の定義を生成（並列処理）"""
+        import asyncio
+        from tqdm import tqdm
+
         if not self.vector_store or not self.llm:
             logger.warning("Vector store or LLM not available for definition generation")
             return technical_terms
@@ -515,14 +544,14 @@ class TermExtractor:
         prompt = get_definition_generation_prompt()
         chain = prompt | self.llm | StrOutputParser()
 
-        for i, term in enumerate(technical_terms, 1):
+        async def generate_definition(term: Dict) -> Dict:
+            """1つの用語の定義を生成"""
             try:
                 headword = term.get("headword", "")
                 if not headword:
-                    continue
+                    return term
 
                 # ベクトルストアから関連文書を検索
-                logger.debug(f"Searching context for: {headword}")
                 docs = self.vector_store.similarity_search(headword, k=5)
 
                 if docs:
@@ -536,17 +565,32 @@ class TermExtractor:
                     })
 
                     term["definition"] = definition.strip()
-                    logger.info(f"[{i}/{len(technical_terms)}] Generated definition for: {headword}")
                 else:
                     # コンテキストが見つからない場合は簡易定義
                     term["definition"] = f"{headword}（関連文書が見つかりません）"
-                    logger.warning(f"[{i}/{len(technical_terms)}] No context found for: {headword}")
+                    logger.warning(f"No context found for: {headword}")
 
             except Exception as e:
                 logger.error(f"Failed to generate definition for '{term.get('headword')}': {e}")
                 term["definition"] = ""
 
-        return technical_terms
+            return term
+
+        # 並列実行（プログレスバー付き）
+        tasks = [generate_definition(term) for term in technical_terms]
+
+        results = []
+        with tqdm(total=len(tasks), desc="定義生成", unit="用語", ncols=80) as pbar:
+            for coro in asyncio.as_completed(tasks):
+                result = await coro
+                results.append(result)
+                pbar.update(1)
+
+        # 元の順序を保持するため、headwordでソート
+        headword_to_result = {r.get("headword"): r for r in results}
+        ordered_results = [headword_to_result[t.get("headword")] for t in technical_terms if t.get("headword") in headword_to_result]
+
+        return ordered_results
 
     async def _detect_synonyms_with_candidates(self, technical_terms: List[Dict], all_candidates: List[Dict]) -> List[Dict]:
         """類義語の検出（候補プール全体を使用）"""

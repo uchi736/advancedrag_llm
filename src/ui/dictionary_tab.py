@@ -302,18 +302,22 @@ def render_dictionary_tab(rag_system):
     )
 
     if view_mode == "カード形式":
+        # Batch render to reduce WebSocket calls
         for idx, row in terms_df.iterrows():
-            render_term_card(row)
-            # Use term as unique key instead of id (which doesn't exist in ChromaDB)
-            delete_key = f"delete_card_{row['term']}_{idx}" if 'id' not in row else f"delete_card_{row['id']}"
-            if st.button("削除", key=delete_key, use_container_width=True):
-                deleted, errors = rag_system.delete_jargon_terms([row['term']])
-                if deleted:
-                    st.success(f"用語「{row['term']}」を削除しました。")
-                    get_all_terms_cached.clear()
-                    st.rerun()
-                else:
-                    st.error(f"用語「{row['term']}」の削除に失敗しました。")
+            with st.container():
+                render_term_card(row)
+                # Use hash for stable keys to prevent WebSocket errors
+                import hashlib
+                term_hash = hashlib.md5(f"{row['term']}_{idx}".encode()).hexdigest()[:8]
+                delete_key = f"delete_card_{term_hash}"
+                if st.button("削除", key=delete_key, use_container_width=True):
+                    deleted, errors = rag_system.delete_jargon_terms([row['term']])
+                    if deleted:
+                        st.success(f"用語「{row['term']}」を削除しました。")
+                        get_all_terms_cached.clear()
+                        st.rerun()
+                    else:
+                        st.error(f"用語「{row['term']}」の削除に失敗しました。")
 
     else: # テーブル形式
         display_df = terms_df.copy()

@@ -57,57 +57,84 @@ def render_documents_tab(rag_system):
         st.session_state.doc_to_show_chunks = None
 
     if not docs_df.empty:
-        # Display header
-        header_cols = st.columns([3, 1, 2, 2])
-        header_cols[0].markdown("**Document ID**")
-        header_cols[1].markdown("**Chunks**")
-        header_cols[2].markdown("**Last Updated**")
-        header_cols[3].markdown("**Actions**")
+        # Use dataframe for efficient display instead of loop
+        display_df = docs_df.copy()
+        display_df['表示'] = False
 
-        for index, row in docs_df.iterrows():
-            doc_id = row["Document ID"]
-            cols = st.columns([3, 1, 2, 2])
-            cols[0].markdown(f'<span style="color: #FAFAFA;">{doc_id}</span>', unsafe_allow_html=True)
-            cols[1].markdown(f'<span style="color: #FAFAFA;">{row["Chunks"]}</span>', unsafe_allow_html=True)
-            cols[2].markdown(f'<span style="color: #FAFAFA;">{row["Last Updated"]}</span>', unsafe_allow_html=True)
-            
-            if cols[3].button("チャンク表示/非表示", key=f"toggle_chunks_{doc_id}"):
-                if st.session_state.doc_to_show_chunks == doc_id:
-                    st.session_state.doc_to_show_chunks = None # Hide if already shown
-                else:
-                    st.session_state.doc_to_show_chunks = doc_id # Show this one
-            
-            if st.session_state.doc_to_show_chunks == doc_id:
-                with st.spinner(f"'{doc_id}'のチャンクを取得中..."):
-                    chunks_df = rag_system.get_chunks_by_document_id(doc_id)
-                
-                if not chunks_df.empty:
-                    st.info(f"{len(chunks_df)}個のチャンクが見つかりました。")
-                    
-                    csv = chunks_df.to_csv(index=False).encode('utf-8')
-                    st.download_button(
-                        label="💾 全チャンクをCSVでダウンロード",
-                        data=csv,
-                        file_name=f"chunks_{doc_id}.csv",
-                        mime="text/csv",
-                        key=f"download_chunks_{doc_id}"
-                    )
-                    
-                    for _, chunk_row in chunks_df.iterrows():
-                        st.markdown("---")
-                        st.markdown(f"**Chunk ID:** `{chunk_row['chunk_id']}`")
-                        
-                        # Use a markdown container with custom CSS for better readability and scrolling
-                        st.markdown(
-                            f"""
-                            <div style="background-color: #262730; border-radius: 0.5rem; padding: 10px; height: 200px; overflow-y: auto; border: 1px solid #333;">
-                                <pre style="white-space: pre-wrap; word-wrap: break-word; color: #FAFAFA;">{chunk_row['content']}</pre>
-                            </div>
-                            """,
-                            unsafe_allow_html=True
+        # Add an editable column for viewing chunks
+        edited_df = st.data_editor(
+            display_df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Document ID": st.column_config.TextColumn("Document ID", width="large"),
+                "Chunks": st.column_config.NumberColumn("Chunks", width="small"),
+                "Last Updated": st.column_config.TextColumn("Last Updated", width="medium"),
+                "表示": st.column_config.CheckboxColumn(
+                    "チャンク表示",
+                    help="チャンクを表示する場合はチェック",
+                    default=False,
+                    width="small"
+                )
+            },
+            disabled=["Document ID", "Chunks", "Last Updated"],
+            key="docs_table_editor"
+        )
+
+        # Show chunks for checked documents
+        docs_to_show = edited_df[edited_df['表示'] == True]
+        if not docs_to_show.empty:
+            st.markdown("---")
+            st.markdown("### 📄 チャンク詳細")
+            for _, row in docs_to_show.iterrows():
+                doc_id = row["Document ID"]
+                with st.expander(f"📋 {doc_id} のチャンク ({row['Chunks']}個)", expanded=True):
+                    with st.spinner(f"'{doc_id}'のチャンクを取得中..."):
+                        chunks_df = rag_system.get_chunks_by_document_id(doc_id)
+
+                    if not chunks_df.empty:
+                        csv = chunks_df.to_csv(index=False).encode('utf-8')
+                        st.download_button(
+                            label="💾 全チャンクをCSVでダウンロード",
+                            data=csv,
+                            file_name=f"chunks_{doc_id}.csv",
+                            mime="text/csv",
+                            key=f"download_chunks_{doc_id}"
                         )
-                else:
-                    st.warning("このドキュメントにはチャンクデータが見つかりませんでした。")
+
+                        # Display chunks in a dataframe instead of loop for better performance
+                        chunk_display_df = chunks_df[['chunk_id', 'content']].copy()
+                        chunk_display_df['content'] = chunk_display_df['content'].str[:200] + '...'
+
+                        st.dataframe(
+                            chunk_display_df,
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config={
+                                "chunk_id": "Chunk ID",
+                                "content": st.column_config.TextColumn("Content (Preview)", width="large")
+                            }
+                        )
+
+                        # Optional: Show full content for selected chunk
+                        selected_chunk = st.selectbox(
+                            "全文を表示するチャンクを選択:",
+                            ["選択してください..."] + chunks_df['chunk_id'].tolist(),
+                            key=f"chunk_selector_{doc_id}"
+                        )
+
+                        if selected_chunk != "選択してください...":
+                            full_content = chunks_df[chunks_df['chunk_id'] == selected_chunk]['content'].iloc[0]
+                            st.markdown(
+                                f"""
+                                <div style="background-color: #262730; border-radius: 0.5rem; padding: 10px; max-height: 400px; overflow-y: auto; border: 1px solid #333;">
+                                    <pre style="white-space: pre-wrap; word-wrap: break-word; color: #FAFAFA;">{full_content}</pre>
+                                </div>
+                                """,
+                                unsafe_allow_html=True
+                            )
+                    else:
+                        st.warning("このドキュメントにはチャンクデータが見つかりませんでした。")
         
         st.markdown("---")
         st.markdown("### 🗑️ ドキュメント削除")

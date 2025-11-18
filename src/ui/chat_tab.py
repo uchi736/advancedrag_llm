@@ -406,22 +406,28 @@ def _render_bulk_query_section(rag_system):
                         rows = [row for row in csv_reader if row]
                         
                         progress_bar = st.progress(0)
+                        status_container = st.empty()
                         total_questions = len(rows)
-                        
+
                         for i, row in enumerate(rows):
                             if not row:  # Skip empty rows
                                 continue
-                                
+
                             question = row[0] if len(row) > 0 else ""
                             if not question:
                                 continue
-                            
+
+                            # Update progress every 5 questions or at the end to reduce WebSocket traffic
+                            if (i + 1) % 5 == 0 or (i + 1) == total_questions:
+                                progress_bar.progress((i + 1) / total_questions)
+                                status_container.text(f"処理中: {i + 1}/{total_questions}")
+
                             # Extract expected sources (columns 1, 2, 3, ...)
                             expected_sources = []
                             for j in range(1, len(row)):
                                 if row[j].strip():  # Non-empty expected source
                                     expected_sources.append(row[j].strip())
-                            
+
                             response = rag_system.query_unified(
                                 question,
                                 use_query_expansion=use_qe_bulk,
@@ -430,7 +436,7 @@ def _render_bulk_query_section(rag_system):
                                 use_reranking=use_rr_bulk,
                                 search_type=st.session_state.get('search_type', 'ハイブリッド検索')
                             )
-                            
+
                             answer = response.get("answer", "回答なし")
                             sources = response.get("sources", [])
 
@@ -454,8 +460,9 @@ def _render_bulk_query_section(rag_system):
                                 result_row[f"チャンク{idx+1}"] = cell_content
 
                             st.session_state.bulk_results.append(result_row)
-                            progress_bar.progress((i + 1) / total_questions)
-                            
+
+                        progress_bar.progress(1.0)
+                        status_container.empty()
                         st.success("一括処理が完了しました。")
                         st.session_state.bulk_processing = False
                     except Exception as e:

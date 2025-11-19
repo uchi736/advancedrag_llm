@@ -86,7 +86,7 @@ class Config:
     keyword_search_k: int = 3
     final_k: int = 5
     collection_name: str = "documents"
-    fts_language: str = "english"
+    fts_language: str = "simple"  # Use 'simple' for language-agnostic search (supports Japanese, English, and mixed content)
     rrf_k_for_fusion: int = 60
     distance_strategy: str = "COSINE"
     vector_store_type: str = "pgvector"

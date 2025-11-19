@@ -147,3 +147,164 @@ def get_definition_generation_prompt():
         ("system", DEFINITION_GENERATION_SYSTEM_PROMPT),
         ("human", DEFINITION_GENERATION_USER_PROMPT_SIMPLE)
     ])
+
+# Term extraction: Stage 1 - Candidate extraction
+CANDIDATE_EXTRACTION_SYSTEM_PROMPT = """あなたは専門用語候補の抽出エキスパートです。
+与えられたテキストから、専門用語の可能性がある単語・フレーズを幅広く抽出してください。
+
+抽出基準（緩めに判定）:
+- 技術的・専門的な概念を表す可能性がある語句
+- 業界用語、学術用語、技術用語の可能性があるもの
+- 略語・頭字語
+- カタカナ語、英語
+- 複合語、専門的な動詞・名詞
+- 文脈で特別な意味を持ちそうな一般語も含める
+
+出力形式:
+{format_instructions}
+
+注意事項:
+- この段階では緩めに判定し、可能性があるものは幅広く含める
+- 「学習」「処理」「システム」「実装」なども文脈次第で含める
+- 信頼度は専門用語らしさを0.0-1.0で表現
+- この段階では定義は不要（用語名のみ）"""
+
+CANDIDATE_EXTRACTION_USER_PROMPT = "以下のテキストから専門用語候補を抽出してください:\n\n{text}"
+
+# Term extraction: Stage 2 - Technical term filtering
+TECHNICAL_TERM_FILTER_SYSTEM_PROMPT = """抽出された候補から、本当に専門用語として適切なものだけを選別してください。
+
+専門用語として残すべきもの:
+- 明確に技術的・専門的な用語
+- 業界特有の確立された用語
+- 略語・頭字語
+- 複合語の専門用語
+
+一般語として除外すべきもの（ただし類義語候補としては有用）:
+- 汎用的すぎる単語（データ、システム、処理など）
+- 一般的な動詞・形容詞
+- 広すぎる概念
+
+出力形式:
+{format_instructions}
+
+注意：除外した語も後で類義語検出に使うため、関連性が高いものは記憶しておいてください。"""
+
+TECHNICAL_TERM_FILTER_USER_PROMPT = "以下の候補から専門用語を選別してください:\n{candidates_json}"
+
+# Term extraction: Stage 4a - Term synonym grouping
+TERM_SYNONYM_GROUPING_SYSTEM_PROMPT = """専門用語リストから、同義語・類義語のグループを作成し、代表語に集約してください。
+
+目的:
+- 同じ概念を指す専門用語を1つの代表語にまとめる
+- 表記ゆれや言語違い（日本語/英語）を統一
+- 重複を削減して効率化
+- 各用語の分野（ドメイン）を自動分類
+
+グループ化の基準:
+1. 完全な同義語（同じ概念）: 「機械学習」と「Machine Learning」
+2. 略語と正式名称: 「ML」と「機械学習」
+3. 英語と日本語: 「Deep Learning」と「深層学習」
+4. 表記ゆれ: 「ヒートエクスチェンジャー」と「熱交換器」
+
+代表語の選択基準（優先順位）:
+1. 日本語 > 英語 > 略語
+2. 定義が充実している方
+3. より正式な名称（フルスペル）
+
+分野（domain）の分類基準:
+- 用語が属する主要な学問・産業分野を1つ選択
+- 例: 医療、工学、法律、経済、情報技術、製造、エネルギー、環境、建築、化学など
+- 複数の分野にまたがる場合は最も関連が強い分野を選択
+- 一般的すぎる用語は「一般」とする
+
+出力形式（JSON配列）:
+[
+  {{
+    "headword": "機械学習",           // 代表語（日本語優先）
+    "synonyms": ["Machine Learning", "ML"],  // 同義語リスト
+    "definition": "...",               // 定義（代表語の定義を採用）
+    "domain": "情報技術"              // 分野（必須）
+  }},
+  {{
+    "headword": "深層学習",
+    "synonyms": ["Deep Learning", "DL"],
+    "definition": "...",
+    "domain": "情報技術"
+  }},
+  {{
+    "headword": "熱交換器",
+    "synonyms": ["ヒートエクスチェンジャー"],
+    "definition": "...",
+    "domain": "工学"
+  }}
+]
+
+注意:
+- JSONは完全な形式で出力すること
+- 定義は簡潔に（1-2文、100文字程度）まとめてください
+- 文字列の途中で改行しないこと
+
+注意事項:
+- 同義語でないものは別グループにする
+- 関連語（例: 機械学習と深層学習）は別グループ
+- 各用語は必ずいずれかのグループに含める
+- 代表語に選ばれなかった用語も必ずsynonymsに含める
+- domainは必ず指定すること"""
+
+TERM_SYNONYM_GROUPING_USER_PROMPT = "以下の専門用語リストをグループ化してください:\n\n{technical_terms_json}"
+
+# Term extraction: Stage 4b - Synonym detection with candidates
+SYNONYM_DETECTION_SYSTEM_PROMPT = """専門用語（代表語）と一般語候補の間の類義語・関連語を検出してください。
+
+⚠️ 重要な制約:
+- 候補プールに存在しない語句は絶対に追加しないでください
+- LLMの一般知識から類義語を生成せず、必ず候補プール内の語句のみを使用してください
+- 文書に実際に出現した語句のみを類義語として検出してください
+
+入力:
+- representative_terms: 代表語（専門用語間で既に集約済み）
+- candidates: 一般語候補（専門用語として選ばれなかった語）
+
+類義語の種類（候補プール内に存在する場合のみ）:
+1. 専門用語と一般的な表現の関係（例：「機械学習」と「学習」「訓練」）
+2. 略語・別名
+3. 英語と日本語の対訳（候補に含まれる場合）
+
+出力形式:
+- JSON形式で、各代表語に対して候補プールから関連する語をリストアップ
+- 候補プールに存在しない語句は絶対に含めないこと
+
+例:
+代表語「機械学習」(既に"Machine Learning"を含む)
+→ 候補プールから「学習」「訓練」「ML」を追加 → ✅"""
+
+SYNONYM_DETECTION_USER_PROMPT = "代表語:\n{representative_terms_json}\n\n一般語候補:\n{candidates_json}\n\n上記から類義語関係を検出してください。候補プールに存在しない語句は絶対に追加しないでください。"
+
+def get_candidate_extraction_prompt():
+    """Stage 1: 候補抽出プロンプト"""
+    return ChatPromptTemplate.from_messages([
+        ("system", CANDIDATE_EXTRACTION_SYSTEM_PROMPT),
+        ("user", CANDIDATE_EXTRACTION_USER_PROMPT)
+    ])
+
+def get_technical_term_filter_prompt():
+    """Stage 2: 専門用語選別プロンプト"""
+    return ChatPromptTemplate.from_messages([
+        ("system", TECHNICAL_TERM_FILTER_SYSTEM_PROMPT),
+        ("user", TECHNICAL_TERM_FILTER_USER_PROMPT)
+    ])
+
+def get_term_synonym_grouping_prompt():
+    """Stage 4a: 専門用語間の類義語判定プロンプト"""
+    return ChatPromptTemplate.from_messages([
+        ("system", TERM_SYNONYM_GROUPING_SYSTEM_PROMPT),
+        ("user", TERM_SYNONYM_GROUPING_USER_PROMPT)
+    ])
+
+def get_synonym_detection_prompt():
+    """Stage 4b: 代表語と一般語の類義語判定プロンプト"""
+    return ChatPromptTemplate.from_messages([
+        ("system", SYNONYM_DETECTION_SYSTEM_PROMPT),
+        ("user", SYNONYM_DETECTION_USER_PROMPT)
+    ])

@@ -28,6 +28,7 @@ class ExtractedTerm(BaseModel):
     term: str = Field(description="専門用語")
     synonyms: List[str] = Field(default_factory=list, description="類義語・別名のリスト")
     confidence: float = Field(default=1.0, description="信頼度スコア")
+    domain: Optional[str] = Field(default=None, description="分野・ドメイン（例: 医療、工学、法律など）")
 
 
 class ExtractedTermList(BaseModel):
@@ -163,8 +164,38 @@ class TermExtractor:
         self.pg_url = pg_url
         self.jargon_table_name = jargon_table_name
 
-        # データベース接続
-        self.engine = create_engine(pg_url) if pg_url else None
+        # データベース接続（接続プール設定を最適化）
+        if pg_url:
+            self.engine = create_engine(
+                pg_url,
+                pool_size=20,           # 基本プールサイズを20に増加
+                max_overflow=30,        # 追加で30接続（合計50接続まで）
+                pool_timeout=60,        # タイムアウトを60秒に延長
+                pool_pre_ping=True,     # 接続の有効性を事前確認
+                pool_recycle=3600       # 1時間で接続をリサイクル
+            )
+            logger.info(f"Database engine created with pool_size=20, max_overflow=30")
+        else:
+            self.engine = None
+
+        # ハイブリッドRetrieverの初期化（ベクトル + キーワード検索）
+        self.hybrid_retriever = None
+        if vector_store and pg_url and self.engine:
+            try:
+                from src.rag.retriever import JapaneseHybridRetriever
+                from src.rag.text_processor import JapaneseTextProcessor
+
+                self.hybrid_retriever = JapaneseHybridRetriever(
+                    vector_store=vector_store,
+                    connection_string=pg_url,
+                    config_params=config,
+                    text_processor=JapaneseTextProcessor(),
+                    search_type="hybrid",
+                    engine=self.engine  # 最適化されたengineを共有
+                )
+                logger.info("Hybrid retriever initialized for term extraction")
+            except Exception as e:
+                logger.warning(f"Hybrid retriever initialization failed, falling back to vector-only search: {e}")
 
         # プロンプトとパーサーの初期化
         self._init_prompts()
@@ -180,85 +211,20 @@ class TermExtractor:
 
     def _init_prompts(self):
         """プロンプトの初期化"""
-        # 第1段階：緩い候補抽出プロンプト（定義なし）
-        self.candidate_extraction_prompt = ChatPromptTemplate.from_messages([
-            ("system", """あなたは専門用語候補の抽出エキスパートです。
-与えられたテキストから、専門用語の可能性がある単語・フレーズを幅広く抽出してください。
+        from .prompts import (
+            get_candidate_extraction_prompt,
+            get_technical_term_filter_prompt,
+            get_term_synonym_grouping_prompt,
+            get_synonym_detection_prompt
+        )
 
-抽出基準（緩めに判定）:
-- 技術的・専門的な概念を表す可能性がある語句
-- 業界用語、学術用語、技術用語の可能性があるもの
-- 略語・頭字語
-- カタカナ語、英語
-- 複合語、専門的な動詞・名詞
-- 文脈で特別な意味を持ちそうな一般語も含める
+        # プロンプトを prompts.py から取得
+        self.candidate_extraction_prompt = get_candidate_extraction_prompt()
+        self.technical_term_filter_prompt = get_technical_term_filter_prompt()
+        self.term_synonym_grouping_prompt = get_term_synonym_grouping_prompt()
+        self.synonym_prompt = get_synonym_detection_prompt()
 
-出力形式:
-{format_instructions}
-
-注意事項:
-- この段階では緩めに判定し、可能性があるものは幅広く含める
-- 「学習」「処理」「システム」「実装」なども文脈次第で含める
-- 信頼度は専門用語らしさを0.0-1.0で表現
-- この段階では定義は不要（用語名のみ）"""),
-            ("user", "以下のテキストから専門用語候補を抽出してください:\n\n{text}")
-        ])
-
-        # 第2段階：専門用語選別プロンプト
-        self.technical_term_filter_prompt = ChatPromptTemplate.from_messages([
-            ("system", """抽出された候補から、本当に専門用語として適切なものだけを選別してください。
-
-専門用語として残すべきもの:
-- 明確に技術的・専門的な用語
-- 業界特有の確立された用語
-- 略語・頭字語
-- 複合語の専門用語
-
-一般語として除外すべきもの（ただし類義語候補としては有用）:
-- 汎用的すぎる単語（データ、システム、処理など）
-- 一般的な動詞・形容詞
-- 広すぎる概念
-
-出力形式:
-{format_instructions}
-
-注意：除外した語も後で類義語検出に使うため、関連性が高いものは記憶しておいてください。"""),
-            ("user", "以下の候補から専門用語を選別してください:\n{candidates_json}")
-        ])
-
-        # 類義語抽出プロンプト（専門用語＋候補プール全体を使用）
-        self.synonym_prompt = ChatPromptTemplate.from_messages([
-            ("system", """専門用語と候補語の間の類義語・関連語を検出してください。
-
-⚠️ 重要な制約:
-- 候補プールに存在しない語句は絶対に追加しないでください
-- LLMの一般知識から類義語を生成せず、必ず候補プール内の語句のみを使用してください
-- 文書に実際に出現した語句のみを類義語として検出してください
-
-入力:
-- technical_terms: 確定した専門用語
-- candidates: すべての候補語（専門用語以外も含む）
-
-類義語の種類（候補プール内に存在する場合のみ）:
-1. 完全な同義語（同じ概念を指す）
-2. 略語と正式名称の関係
-3. 英語と日本語の対訳
-4. 専門用語と一般的な表現の関係（例：「機械学習」と「学習」「訓練」）
-5. 表記ゆれ・別名
-
-出力形式:
-- JSON形式で、各専門用語に対して候補プールから関連する語をリストアップ
-- 候補プールに存在しない語句は絶対に含めないこと
-
-例（誤った例）:
-専門用語「電磁石」に対して「エレクトロマグネット」を追加 → ❌ 候補プールにない場合は追加禁止
-
-正しい例:
-専門用語「電磁石」に対して候補プール内の「磁石」「電磁」などのみを追加 → ✅"""),
-            ("user", "専門用語:\n{technical_terms_json}\n\n候補プール:\n{candidates_json}\n\n上記から類義語関係を検出してください。候補プールに存在しない語句は絶対に追加しないでください。")
-        ])
-
-    async def extract_from_documents(self, file_paths: List[Path]) -> Dict[str, Any]:
+    async def extract_from_documents(self, file_paths: List[Path], output_dir: Optional[Path] = None) -> Dict[str, Any]:
         """複数の文書から専門用語を抽出"""
         all_text = []
 
@@ -278,7 +244,7 @@ class TermExtractor:
         combined_text = "\n\n".join(all_text)
 
         # 用語抽出（2段階処理）
-        terms = await self._extract_terms(combined_text)
+        terms = await self._extract_terms(combined_text, output_dir=output_dir)
 
         # 候補プールを抽出（all_candidatesフィールドから）
         all_candidates = []
@@ -320,7 +286,7 @@ class TermExtractor:
             logger.warning(f"Unsupported file type: {suffix}")
             return ""
 
-    async def _extract_terms(self, text: str) -> List[Dict[str, Any]]:
+    async def _extract_terms(self, text: str, output_dir: Optional[Path] = None) -> List[Dict[str, Any]]:
         """テキストから専門用語を抽出（2段階処理）"""
         import asyncio
         from tqdm import tqdm
@@ -389,6 +355,15 @@ class TermExtractor:
         logger.info(f"Stage 1 complete: {len(unique_candidates)} unique candidates extracted")
         print(f"✓ {len(unique_candidates)}個の候補を抽出しました\n")
 
+        # Stage 1結果をファイルに出力
+        if output_dir:
+            stage1_file = output_dir / "stage1_candidates.json"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            with open(stage1_file, "w", encoding="utf-8") as f:
+                json.dump({"candidates": unique_candidates}, f, ensure_ascii=False, indent=2)
+            logger.info(f"Stage 1 results saved to {stage1_file}")
+            print(f"✓ Stage 1 結果を保存: {stage1_file}\n")
+
         # ========== 第2段階: 専門用語の選別 ==========
         technical_terms = []
 
@@ -398,6 +373,14 @@ class TermExtractor:
             technical_terms = await self._filter_technical_terms(unique_candidates)
             logger.info(f"Stage 2 complete: {len(technical_terms)} technical terms selected")
             print(f"✓ {len(technical_terms)}個の専門用語を選別しました\n")
+
+            # Stage 2結果をファイルに出力
+            if output_dir:
+                stage2_file = output_dir / "stage2_technical_terms.json"
+                with open(stage2_file, "w", encoding="utf-8") as f:
+                    json.dump({"technical_terms": technical_terms}, f, ensure_ascii=False, indent=2)
+                logger.info(f"Stage 2 results saved to {stage2_file}")
+                print(f"✓ Stage 2 結果を保存: {stage2_file}\n")
 
         # ========== 第3段階: RAGベースの定義生成（専門用語のみ） ==========
         if technical_terms and self.vector_store:
@@ -409,14 +392,20 @@ class TermExtractor:
             logger.info("Stage 3: Skipping definition generation (no vector store)")
             print(f"[Stage 3] ベクトルストアがないため定義生成をスキップします\n")
 
-        # ========== 第4段階: 類義語検出（候補プール全体を使用） ==========
-        if technical_terms and unique_candidates:
-            logger.info("Stage 4: Detecting synonyms using full candidate pool")
-            print(f"[Stage 4] 類義語を検出中...")
-            technical_terms = await self._detect_synonyms_with_candidates(
-                technical_terms, unique_candidates
-            )
-            print(f"✓ 類義語検出が完了しました\n")
+        # ========== 第4段階: 類義語検出（2段階処理） ==========
+        if technical_terms:
+            # Stage 4a: 専門用語間の類義語判定 + 代表語への集約
+            logger.info("Stage 4a: Detecting synonyms among technical terms and merging")
+            representative_terms = await self._detect_and_merge_term_synonyms(technical_terms)
+
+            # Stage 4b: 代表語と一般語候補の類義語判定
+            if representative_terms and unique_candidates:
+                logger.info("Stage 4b: Detecting synonyms between representative terms and general candidates")
+                representative_terms = await self._detect_synonyms_with_candidates(
+                    representative_terms, unique_candidates
+                )
+
+            technical_terms = representative_terms
 
         # 候補プールも返却用データに含める
         for term in technical_terms:
@@ -529,12 +518,18 @@ class TermExtractor:
             return candidates  # エラー時は全候補を返す
 
     async def _generate_definitions_with_rag(self, technical_terms: List[Dict]) -> List[Dict]:
-        """RAGを使用して専門用語の定義を生成（並列処理）"""
+        """RAGを使用して専門用語の定義を生成（並列処理 + ハイブリッド検索）"""
         import asyncio
         from tqdm import tqdm
 
-        if not self.vector_store or not self.llm:
-            logger.warning("Vector store or LLM not available for definition generation")
+        if not self.llm:
+            logger.warning("LLM not available for definition generation")
+            return technical_terms
+
+        # ハイブリッド検索が使用可能かチェック
+        use_hybrid = self.hybrid_retriever is not None
+        if not use_hybrid and not self.vector_store:
+            logger.warning("Neither hybrid retriever nor vector store available for definition generation")
             return technical_terms
 
         # プロンプトを取得
@@ -544,37 +539,60 @@ class TermExtractor:
         prompt = get_definition_generation_prompt()
         chain = prompt | self.llm | StrOutputParser()
 
+        # セマフォで並列数を制限（DB接続負荷対策）
+        semaphore = asyncio.Semaphore(10)
+
         async def generate_definition(term: Dict) -> Dict:
-            """1つの用語の定義を生成"""
-            try:
+            """1つの用語の定義を生成（リトライ機構付き）"""
+            async with semaphore:  # 同時実行数を最大10に制限
                 headword = term.get("headword", "")
                 if not headword:
                     return term
 
-                # ベクトルストアから関連文書を検索
-                docs = self.vector_store.similarity_search(headword, k=5)
+                # リトライ設定
+                max_retries = 3
+                retry_delay = 2  # 秒
 
-                if docs:
-                    # コンテキストを結合（最大3000文字）
-                    context = "\n\n".join([doc.page_content for doc in docs])[:3000]
+                for attempt in range(max_retries):
+                    try:
+                        # ハイブリッド検索（ベクトル + キーワード）または ベクトルのみ
+                        if use_hybrid:
+                            # ハイブリッド検索: ベクトル + FTS + RRF融合
+                            docs = await self.hybrid_retriever.aget_relevant_documents(headword)
+                        else:
+                            # フォールバック: ベクトル検索のみ
+                            docs = self.vector_store.similarity_search(headword, k=5)
 
-                    # 定義生成
-                    definition = await chain.ainvoke({
-                        "term": headword,
-                        "context": context
-                    })
+                        if docs:
+                            # コンテキストを結合（最大3000文字）
+                            context = "\n\n".join([doc.page_content for doc in docs])[:3000]
 
-                    term["definition"] = definition.strip()
-                else:
-                    # コンテキストが見つからない場合は簡易定義
-                    term["definition"] = f"{headword}（関連文書が見つかりません）"
-                    logger.warning(f"No context found for: {headword}")
+                            # 定義生成
+                            definition = await chain.ainvoke({
+                                "term": headword,
+                                "context": context
+                            })
 
-            except Exception as e:
-                logger.error(f"Failed to generate definition for '{term.get('headword')}': {e}")
-                term["definition"] = ""
+                            term["definition"] = definition.strip()
+                        else:
+                            # コンテキストが見つからない場合は簡易定義
+                            term["definition"] = f"{headword}（関連文書が見つかりません）"
+                            logger.warning(f"No context found for: {headword}")
 
-            return term
+                        # 成功したらループを抜ける
+                        break
+
+                    except Exception as e:
+                        if attempt < max_retries - 1:
+                            # リトライ可能な場合
+                            logger.warning(f"Retry {attempt + 1}/{max_retries} for '{headword}': {e}")
+                            await asyncio.sleep(retry_delay)
+                        else:
+                            # 最終試行でも失敗
+                            logger.error(f"Failed to generate definition for '{headword}' after {max_retries} attempts: {e}")
+                            term["definition"] = f"{headword}（定義生成エラー）"
+
+                return term
 
         # 並列実行（プログレスバー付き）
         tasks = [generate_definition(term) for term in technical_terms]
@@ -592,20 +610,140 @@ class TermExtractor:
 
         return ordered_results
 
-    async def _detect_synonyms_with_candidates(self, technical_terms: List[Dict], all_candidates: List[Dict]) -> List[Dict]:
-        """類義語の検出（候補プール全体を使用）"""
-        if not technical_terms or not all_candidates:
+    async def _detect_and_merge_term_synonyms(self, technical_terms: List[Dict]) -> List[Dict]:
+        """専門用語間の類義語を判定し、代表語に集約（Stage 4a）"""
+        if not technical_terms:
             return technical_terms
 
         try:
-            # 専門用語と候補をJSON化
+            logger.info(f"Detecting synonyms among {len(technical_terms)} technical terms")
+            print(f"[Stage 4a] 専門用語間の類義語を判定中 ({len(technical_terms)}個)...")
+
+            # 用語数が多い場合はバッチ処理
+            batch_size = 50  # 50個ずつ処理
+            all_representative_terms = []
+
+            if len(technical_terms) > batch_size:
+                # バッチ処理
+                print(f"   用語数が多いため、{batch_size}個ずつバッチ処理します...")
+                batches = [technical_terms[i:i + batch_size] for i in range(0, len(technical_terms), batch_size)]
+
+                for batch_idx, batch in enumerate(batches, 1):
+                    print(f"   バッチ {batch_idx}/{len(batches)} を処理中...")
+                    batch_result = await self._group_terms_batch(batch)
+                    all_representative_terms.extend(batch_result)
+
+                logger.info(f"Grouped {len(technical_terms)} terms into {len(all_representative_terms)} representative terms (batched)")
+                print(f"✓ {len(technical_terms)}個の専門用語を{len(all_representative_terms)}個の代表語に集約しました\n")
+                return all_representative_terms
+
+            # 50個以下の場合は一括処理
+            return await self._group_terms_batch(technical_terms)
+
+        except Exception as e:
+            logger.error(f"Term synonym detection failed: {e}")
+            print(f"⚠️  専門用語間の類義語判定でエラーが発生しました: {e}\n")
+            return technical_terms
+
+    async def _group_terms_batch(self, terms: List[Dict]) -> List[Dict]:
+        """用語のバッチをグループ化"""
+        try:
+            # 専門用語をJSON化
             technical_terms_json = json.dumps(
-                [{"term": t.get("headword"), "definition": t.get("definition", "")} for t in technical_terms],
+                [{"term": t.get("headword"), "definition": t.get("definition", "")} for t in terms],
+                ensure_ascii=False,
+                indent=2
+            )
+
+            # LLMで専門用語のグループ化
+            chain = self.term_synonym_grouping_prompt | self.llm
+            result = await chain.ainvoke({
+                "technical_terms_json": technical_terms_json
+            })
+
+            # 結果のパース
+            if hasattr(result, "content"):
+                result_text = result.content
+            else:
+                result_text = str(result)
+
+            # JSONとして解析
+            try:
+                # JSONブロックを抽出（```json ... ``` の場合に対応）
+                import re
+                json_match = re.search(r'```json\s*(\[.*?\])\s*```', result_text, re.DOTALL)
+                if json_match:
+                    result_text = json_match.group(1)
+                else:
+                    # ```なしの場合、配列部分のみ抽出
+                    array_match = re.search(r'\[.*\]', result_text, re.DOTALL)
+                    if array_match:
+                        result_text = array_match.group(0)
+
+                # JSONとして不正な文字を修正（LLMがコメント付きで出力する場合）
+                # // コメントを削除
+                result_text = re.sub(r'//.*', '', result_text)
+
+                grouped_terms = json.loads(result_text)
+
+                # 辞書形式に変換
+                representative_terms = []
+                for group in grouped_terms:
+                    if isinstance(group, dict):
+                        term_dict = {
+                            "headword": group.get("headword", ""),
+                            "synonyms": group.get("synonyms", []),
+                            "definition": group.get("definition", ""),
+                            "domain": group.get("domain", "一般")
+                        }
+                        representative_terms.append(term_dict)
+
+                logger.info(f"Grouped {len(terms)} terms into {len(representative_terms)} representative terms")
+
+                return representative_terms
+
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse term grouping result: {e}")
+                logger.error(f"Result text (first 1000 chars): {result_text[:1000]}")
+                logger.error(f"Result text (last 500 chars): {result_text[-500:]}")
+                # エラー時は元の用語リストをそのまま返す
+                print(f"⚠️  バッチのグループ化に失敗しました。\n")
+                print(f"   JSONパースエラー: {e}\n")
+                print(f"   LLM出力の最初: {result_text[:200]}...\n")
+                return terms
+
+        except Exception as e:
+            logger.error(f"Batch grouping failed: {e}")
+            return terms
+
+    async def _detect_synonyms_with_candidates(self, representative_terms: List[Dict], all_candidates: List[Dict]) -> List[Dict]:
+        """類義語の検出（代表語と一般語候補、Stage 4b）"""
+        if not representative_terms or not all_candidates:
+            return representative_terms
+
+        try:
+            logger.info(f"Detecting synonyms between {len(representative_terms)} representative terms and candidates")
+            print(f"[Stage 4b] 代表語と一般語の類義語を判定中...")
+
+            # 代表語のheadwordリストを作成（専門用語として既に選ばれたものを除外するため）
+            representative_headwords = {t.get("headword") for t in representative_terms}
+
+            # 一般語候補のみを抽出（専門用語を除外）
+            general_candidates = [c for c in all_candidates if c.get("headword") not in representative_headwords]
+
+            if not general_candidates:
+                logger.info("No general candidates found, skipping candidate synonym detection")
+                print(f"✓ 一般語候補がないため、この段階をスキップします\n")
+                return representative_terms
+
+            # 代表語と候補をJSON化
+            representative_terms_json = json.dumps(
+                [{"term": t.get("headword"), "definition": t.get("definition", "")} for t in representative_terms],
                 ensure_ascii=False,
                 indent=2
             )
             candidates_json = json.dumps(
-                [{"term": c.get("headword"), "definition": c.get("definition", "")} for c in all_candidates],
+                [{"term": c.get("headword"), "definition": c.get("definition", "")} for c in general_candidates],
                 ensure_ascii=False,
                 indent=2
             )
@@ -613,7 +751,7 @@ class TermExtractor:
             # 類義語検出
             chain = self.synonym_prompt | self.llm
             result = await chain.ainvoke({
-                "technical_terms_json": technical_terms_json,
+                "representative_terms_json": representative_terms_json,
                 "candidates_json": candidates_json
             })
 
@@ -625,10 +763,16 @@ class TermExtractor:
 
             # JSONとして解析
             try:
+                # JSONブロックを抽出（```json ... ``` の場合に対応）
+                import re
+                json_match = re.search(r'```json\s*(\[.*?\])\s*```', result_text, re.DOTALL)
+                if json_match:
+                    result_text = json_match.group(1)
+
                 synonym_data = json.loads(result_text)
 
-                # 元の専門用語リストに類義語を追加
-                for term in technical_terms:
+                # 代表語リストに一般語候補からの類義語を追加
+                for term in representative_terms:
                     headword = term.get("headword", "")
 
                     # synonym_dataから該当する用語を探す
@@ -636,18 +780,23 @@ class TermExtractor:
                         if isinstance(syn_item, dict) and syn_item.get("term") == headword:
                             new_synonyms = syn_item.get("synonyms", [])
                             existing_synonyms = set(term.get("synonyms", []))
-                            # 候補プールからの類義語も含める
+                            # 一般語候補からの類義語も含める
                             term["synonyms"] = list(existing_synonyms | set(new_synonyms))
                             break
 
-            except json.JSONDecodeError:
-                logger.warning("Failed to parse synonym detection result")
+                logger.info(f"Added general term synonyms to {len(representative_terms)} representative terms")
+                print(f"✓ 代表語に一般語の類義語を追加しました\n")
 
-            return technical_terms
+            except json.JSONDecodeError as e:
+                logger.warning(f"Failed to parse synonym detection result: {e}")
+                print(f"⚠️  類義語判定結果のパースに失敗しました\n")
+
+            return representative_terms
 
         except Exception as e:
             logger.error(f"Synonym detection with candidates failed: {e}")
-            return technical_terms
+            print(f"⚠️  一般語との類義語判定でエラーが発生しました: {e}\n")
+            return representative_terms
 
     def save_to_database(self, terms: List[Dict]) -> int:
         """用語をデータベースに保存"""
@@ -698,8 +847,9 @@ async def run_extraction_pipeline(input_dir: Path, output_json: Path, config, ll
 
     logger.info(f"Found {len(files)} files to process")
 
-    # 用語抽出
-    result = await extractor.extract_from_documents(files)
+    # 用語抽出（output_dirを渡す）
+    output_dir = output_json.parent
+    result = await extractor.extract_from_documents(files, output_dir=output_dir)
     terms = result.get("terms", [])
 
     # JSONファイルに保存

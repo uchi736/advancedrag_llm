@@ -672,11 +672,14 @@ class RAGSystem:
                 docs = rag_results.get("documents") or rag_results.get("context", [])
                 context = format_docs(docs)
 
+                # Use augmented query if available, otherwise use original question
+                final_question = rag_results.get("retrieval_query") or question
+
                 # Generate answer
                 chain = rag_prompt | self.llm | StrOutputParser()
                 answer = chain.invoke({
                     "context": context,
-                    "question": question,
+                    "question": final_question,
                     "jargon_definitions": jargon_definitions
                 })
 

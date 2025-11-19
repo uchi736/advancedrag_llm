@@ -18,6 +18,8 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.documents import Document
 from pydantic import BaseModel, Field
+import asyncio
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
 
@@ -487,39 +489,64 @@ class TermExtractor:
         return list(merged.values())
 
     async def _filter_technical_terms(self, candidates: List[Dict], output_dir: Optional[Path] = None) -> List[Dict]:
-        """候補から専門用語を選別（第2段階）"""
+        """候補から専門用語を選別（第2段階）- バッチ処理対応"""
         if not candidates:
             return []
 
         try:
-            # JSON文字列に変換
-            candidates_json = json.dumps(candidates, ensure_ascii=False, indent=2)
+            # バッチサイズを取得
+            batch_size = getattr(self.config, 'stage2_batch_size', 50)
 
             # FilteredTermResult用のパーサーを使用
             from langchain_core.output_parsers import JsonOutputParser
             filter_parser = JsonOutputParser(pydantic_object=FilteredTermResult)
 
-            # 専門用語選別実行
-            chain = self.technical_term_filter_prompt | self.llm | filter_parser
-            result = await chain.ainvoke({
-                "candidates_json": candidates_json,
-                "format_instructions": filter_parser.get_format_instructions()
-            })
+            # 候補をバッチに分割
+            batches = [candidates[i:i + batch_size] for i in range(0, len(candidates), batch_size)]
+            total_batches = len(batches)
 
-            # 結果の処理
-            selected_terms = []
-            rejected_terms = []
+            logger.info(f"Processing {len(candidates)} candidates in {total_batches} batches (batch size: {batch_size})")
 
-            if hasattr(result, "selected"):
-                selected_terms = result.selected
-                rejected_terms = result.rejected
-            elif isinstance(result, dict):
-                selected_terms = result.get("selected", [])
-                rejected_terms = result.get("rejected", [])
+            # 各バッチを処理
+            all_selected = []
+            all_rejected = []
+
+            async def process_batch(batch_idx: int, batch: List[Dict]) -> tuple:
+                """単一バッチを処理"""
+                candidates_json = json.dumps(batch, ensure_ascii=False, indent=2)
+
+                chain = self.technical_term_filter_prompt | self.llm | filter_parser
+                result = await chain.ainvoke({
+                    "candidates_json": candidates_json,
+                    "format_instructions": filter_parser.get_format_instructions()
+                })
+
+                # 結果の処理
+                selected_terms = []
+                rejected_terms = []
+
+                if hasattr(result, "selected"):
+                    selected_terms = result.selected
+                    rejected_terms = result.rejected
+                elif isinstance(result, dict):
+                    selected_terms = result.get("selected", [])
+                    rejected_terms = result.get("rejected", [])
+
+                return (selected_terms, rejected_terms)
+
+            # バッチを並列処理（プログレスバー付き）
+            tasks = [process_batch(i, batch) for i, batch in enumerate(batches)]
+
+            with tqdm(total=len(tasks), desc="専門用語選別", unit="batch", ncols=80) as pbar:
+                for coro in asyncio.as_completed(tasks):
+                    selected, rejected = await coro
+                    all_selected.extend(selected)
+                    all_rejected.extend(rejected)
+                    pbar.update(1)
 
             # 辞書形式に変換（selected）
             output = []
-            for term in selected_terms:
+            for term in all_selected:
                 if hasattr(term, "dict"):
                     term_dict = term.dict()
                 elif isinstance(term, dict):
@@ -535,7 +562,7 @@ class TermExtractor:
 
             # 辞書形式に変換（rejected）
             rejected_output = []
-            for term in rejected_terms:
+            for term in all_rejected:
                 if hasattr(term, "dict"):
                     term_dict = term.dict()
                 elif isinstance(term, dict):
@@ -556,6 +583,12 @@ class TermExtractor:
                     json.dump({"rejected_terms": rejected_output}, f, ensure_ascii=False, indent=2)
                 logger.info(f"Stage 2 rejected terms saved to {stage2_rejected_file}")
                 print(f"✓ Stage 2 除外用語を保存: {stage2_rejected_file} ({len(rejected_output)}個)\n")
+
+            # 検証: selected + rejected = total candidates
+            processed_count = len(output) + len(rejected_output)
+            if processed_count != len(candidates):
+                logger.warning(f"Validation failed: {processed_count} processed (selected: {len(output)}, rejected: {len(rejected_output)}) != {len(candidates)} input candidates. Missing: {len(candidates) - processed_count}")
+                print(f"⚠️  警告: 処理済み用語数 ({processed_count}) が入力候補数 ({len(candidates)}) と一致しません。未処理: {len(candidates) - processed_count}個\n")
 
             logger.info(f"Technical term filtering: {len(output)} selected, {len(rejected_output)} rejected from {len(candidates)} candidates")
             return output

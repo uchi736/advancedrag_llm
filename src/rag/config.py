@@ -63,7 +63,7 @@ class Config:
 
         # LLM settings
         self.llm_temperature = float(os.getenv("LLM_TEMPERATURE", "0.0"))
-        self.max_tokens = int(os.getenv("MAX_TOKENS", "4096"))
+        self.max_tokens = int(os.getenv("MAX_TOKENS", "16384"))
 
         # Azure Document Intelligence settings
         self.azure_di_endpoint = os.getenv("AZURE_DI_ENDPOINT")
@@ -109,3 +109,4 @@ class Config:
 
     # Term extraction settings (LLM-based)
     llm_extraction_chunk_size: int = 3000  # Text chunk size for LLM processing
+    stage2_batch_size: int = 50  # Batch size for Stage 2 technical term filtering

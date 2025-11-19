@@ -24,16 +24,24 @@ logger = logging.getLogger(__name__)
 
 # ========== Pydantic Models ==========
 class ExtractedTerm(BaseModel):
-    """抽出された専門用語候補（定義なし）"""
+    """抽出された専門用語候補"""
     term: str = Field(description="専門用語")
+    brief_definition: Optional[str] = Field(default=None, description="周辺テキストから抽出した簡易的な定義・説明（1-2文）")
     synonyms: List[str] = Field(default_factory=list, description="類義語・別名のリスト")
     confidence: float = Field(default=1.0, description="信頼度スコア")
     domain: Optional[str] = Field(default=None, description="分野・ドメイン（例: 医療、工学、法律など）")
+    rejection_reason: Optional[str] = Field(default=None, description="除外理由（除外された場合のみ）")
 
 
 class ExtractedTermList(BaseModel):
     """専門用語リスト"""
     terms: List[ExtractedTerm] = Field(description="抽出された専門用語のリスト")
+
+
+class FilteredTermResult(BaseModel):
+    """Stage 2の選別結果（選ばれた用語と除外された用語）"""
+    selected: List[ExtractedTerm] = Field(description="専門用語として選ばれた用語")
+    rejected: List[ExtractedTerm] = Field(description="除外された用語（rejection_reason付き）")
 
 
 # ========== JargonDictionaryManager (互換性のため残す) ==========
@@ -370,7 +378,7 @@ class TermExtractor:
         if unique_candidates:
             logger.info("Stage 2: Filtering technical terms from candidates")
             print(f"[Stage 2] 専門用語を選別中...")
-            technical_terms = await self._filter_technical_terms(unique_candidates)
+            technical_terms = await self._filter_technical_terms(unique_candidates, output_dir=output_dir)
             logger.info(f"Stage 2 complete: {len(technical_terms)} technical terms selected")
             print(f"✓ {len(technical_terms)}個の専門用語を選別しました\n")
 
@@ -470,7 +478,7 @@ class TermExtractor:
 
         return list(merged.values())
 
-    async def _filter_technical_terms(self, candidates: List[Dict]) -> List[Dict]:
+    async def _filter_technical_terms(self, candidates: List[Dict], output_dir: Optional[Path] = None) -> List[Dict]:
         """候補から専門用語を選別（第2段階）"""
         if not candidates:
             return []
@@ -479,24 +487,31 @@ class TermExtractor:
             # JSON文字列に変換
             candidates_json = json.dumps(candidates, ensure_ascii=False, indent=2)
 
+            # FilteredTermResult用のパーサーを使用
+            from langchain_core.output_parsers import JsonOutputParser
+            filter_parser = JsonOutputParser(pydantic_object=FilteredTermResult)
+
             # 専門用語選別実行
-            chain = self.technical_term_filter_prompt | self.llm | self.json_parser
+            chain = self.technical_term_filter_prompt | self.llm | filter_parser
             result = await chain.ainvoke({
                 "candidates_json": candidates_json,
-                "format_instructions": self.json_parser.get_format_instructions()
+                "format_instructions": filter_parser.get_format_instructions()
             })
 
             # 結果の処理
-            if hasattr(result, "terms"):
-                technical_terms = result.terms
-            elif isinstance(result, dict):
-                technical_terms = result.get("terms", [])
-            else:
-                technical_terms = []
+            selected_terms = []
+            rejected_terms = []
 
-            # 辞書形式に変換
+            if hasattr(result, "selected"):
+                selected_terms = result.selected
+                rejected_terms = result.rejected
+            elif isinstance(result, dict):
+                selected_terms = result.get("selected", [])
+                rejected_terms = result.get("rejected", [])
+
+            # 辞書形式に変換（selected）
             output = []
-            for term in technical_terms:
+            for term in selected_terms:
                 if hasattr(term, "dict"):
                     term_dict = term.dict()
                 elif isinstance(term, dict):
@@ -510,7 +525,31 @@ class TermExtractor:
 
                 output.append(term_dict)
 
-            logger.info(f"Technical term filtering: {len(output)}/{len(candidates)} selected as technical terms")
+            # 辞書形式に変換（rejected）
+            rejected_output = []
+            for term in rejected_terms:
+                if hasattr(term, "dict"):
+                    term_dict = term.dict()
+                elif isinstance(term, dict):
+                    term_dict = term
+                else:
+                    continue
+
+                # headwordフィールドに変換
+                if "term" in term_dict:
+                    term_dict["headword"] = term_dict.pop("term")
+
+                rejected_output.append(term_dict)
+
+            # Stage 2除外用語をファイルに出力
+            if output_dir and rejected_output:
+                stage2_rejected_file = output_dir / "stage2_rejected.json"
+                with open(stage2_rejected_file, "w", encoding="utf-8") as f:
+                    json.dump({"rejected_terms": rejected_output}, f, ensure_ascii=False, indent=2)
+                logger.info(f"Stage 2 rejected terms saved to {stage2_rejected_file}")
+                print(f"✓ Stage 2 除外用語を保存: {stage2_rejected_file} ({len(rejected_output)}個)\n")
+
+            logger.info(f"Technical term filtering: {len(output)} selected, {len(rejected_output)} rejected from {len(candidates)} candidates")
             return output
 
         except Exception as e:
@@ -768,6 +807,15 @@ class TermExtractor:
                 json_match = re.search(r'```json\s*(\[.*?\])\s*```', result_text, re.DOTALL)
                 if json_match:
                     result_text = json_match.group(1)
+                else:
+                    # ```なしの場合、配列部分のみ抽出
+                    array_match = re.search(r'\[.*\]', result_text, re.DOTALL)
+                    if array_match:
+                        result_text = array_match.group(0)
+
+                # JSONとして不正な文字を修正（LLMがコメント付きで出力する場合）
+                # // コメントを削除
+                result_text = re.sub(r'//.*', '', result_text)
 
                 synonym_data = json.loads(result_text)
 
@@ -788,8 +836,12 @@ class TermExtractor:
                 print(f"✓ 代表語に一般語の類義語を追加しました\n")
 
             except json.JSONDecodeError as e:
-                logger.warning(f"Failed to parse synonym detection result: {e}")
+                logger.error(f"Failed to parse synonym detection result: {e}")
+                logger.error(f"Result text (first 1000 chars): {result_text[:1000]}")
+                logger.error(f"Result text (last 500 chars): {result_text[-500:]}")
                 print(f"⚠️  類義語判定結果のパースに失敗しました\n")
+                print(f"   JSONパースエラー: {e}\n")
+                print(f"   LLM出力の最初: {result_text[:200]}...\n")
 
             return representative_terms
 

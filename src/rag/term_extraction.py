@@ -471,6 +471,14 @@ class TermExtractor:
 
                 # 信頼度は平均を取る
                 existing["confidence"] = (existing.get("confidence", 1.0) + term.get("confidence", 1.0)) / 2
+
+                # brief_definitionを連結
+                existing_def = existing.get("brief_definition", "")
+                new_def = term.get("brief_definition", "")
+                if existing_def and new_def and new_def not in existing_def:
+                    existing["brief_definition"] = f"{existing_def} {new_def}"
+                elif not existing_def and new_def:
+                    existing["brief_definition"] = new_def
             else:
                 # 新規追加
                 merged[key] = term.copy()

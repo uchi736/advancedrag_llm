@@ -27,6 +27,8 @@ def initialize_session_state():
         st.session_state.search_type = "ハイブリッド検索"
     if "session_id" not in st.session_state:
         st.session_state.session_id = str(uuid.uuid4())
+    if "selected_collection" not in st.session_state:
+        st.session_state.selected_collection = os.getenv("COLLECTION_NAME", "documents")
 
 @st.cache_resource(show_spinner=False)
 def initialize_rag_system(config_obj: Config) -> RAGSystem:
@@ -47,6 +49,9 @@ def get_rag_system():
 
         if all([azure_api_key, azure_endpoint, azure_chat_deployment, azure_embedding_deployment]):
             try:
+                # Use selected_collection from session_state, fallback to environment variable
+                collection_name = st.session_state.get("selected_collection", os.getenv("COLLECTION_NAME", "documents"))
+
                 app_config = Config(
                     azure_openai_api_key=azure_api_key,
                     azure_openai_endpoint=azure_endpoint,
@@ -56,7 +61,7 @@ def get_rag_system():
                     db_password=os.getenv("DB_PASSWORD", "postgres"),
                     llm_model_identifier=os.getenv("LLM_MODEL_IDENTIFIER", "gpt-4.1-mini"),
                     embedding_model_identifier=os.getenv("EMBEDDING_MODEL_IDENTIFIER", "text-embedding-ada-002"),
-                    collection_name=os.getenv("COLLECTION_NAME", "documents"),
+                    collection_name=collection_name,
                     final_k=int(os.getenv("FINAL_K", 5)),
                     enable_jargon_augmentation=st.session_state.use_jargon_augmentation
                 )

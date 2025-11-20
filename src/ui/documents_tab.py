@@ -1,7 +1,22 @@
 import streamlit as st
 import pandas as pd
 import time
+from sqlalchemy import text
 from src.utils.helpers import _persist_uploaded_file, get_documents_dataframe
+
+def _get_available_collections(rag_system):
+    """Get list of available collections from database"""
+    try:
+        with rag_system.engine.connect() as conn:
+            result = conn.execute(text("""
+                SELECT DISTINCT collection_name
+                FROM document_chunks
+                ORDER BY collection_name
+            """))
+            collections = [row[0] for row in result]
+            return collections if collections else [rag_system.config.collection_name]
+    except Exception as e:
+        return [rag_system.config.collection_name]
 
 def render_documents_tab(rag_system):
     """Renders the document management tab."""
@@ -10,10 +25,52 @@ def render_documents_tab(rag_system):
         return
 
     st.markdown("### 📤 ドキュメントアップロード")
-    
+
+    # Collection selection UI
+    st.markdown("#### 📂 保存先コレクション")
+
+    col1, col2 = st.columns([3, 1])
+
+    with col1:
+        # Get available collections
+        available_collections = _get_available_collections(rag_system)
+
+        # New collection or existing collection
+        use_new_collection = st.checkbox("新規コレクションを作成", key="use_new_collection")
+
+        if use_new_collection:
+            selected_collection = st.text_input(
+                "新規コレクション名",
+                placeholder="例: 技術文書, 営業資料, 法務文書",
+                key="new_collection_name"
+            )
+        else:
+            current_collection = st.session_state.get("selected_collection", rag_system.config.collection_name)
+            selected_collection = st.selectbox(
+                "既存のコレクションを選択",
+                available_collections,
+                index=available_collections.index(current_collection) if current_collection in available_collections else 0,
+                key="existing_collection_selector"
+            )
+
+    with col2:
+        st.markdown("<br><br>", unsafe_allow_html=True)
+        if selected_collection:
+            st.info(f"**保存先:**\n{selected_collection}")
+
+    # Collection change handling
+    if selected_collection and selected_collection != st.session_state.get("selected_collection"):
+        st.session_state.selected_collection = selected_collection
+        # Clear RAG system to reinitialize with new collection
+        if "rag_system" in st.session_state:
+            del st.session_state["rag_system"]
+        st.rerun()
+
+    st.markdown("---")
+
     # PDF処理方式の表示
     st.info(f"📑 PDF処理方式: **Azure Document Intelligence**")
-    
+
     uploaded_docs = st.file_uploader(
         "ファイルを選択またはドラッグ&ドロップ (.pdf)",
         accept_multiple_files=True,

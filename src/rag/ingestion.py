@@ -327,20 +327,31 @@ class IngestionHandler:
                 print(f"    - {f}")
         print(f"{'='*60}")
 
-    def delete_document_by_id(self, doc_id: str) -> tuple[bool, str]:
-        """Delete a document and all its chunks."""
+    def delete_document_by_id(self, doc_id: str, collection_name: str = None) -> tuple[bool, str]:
+        """Delete a document and all its chunks from a specific collection.
+
+        Args:
+            doc_id: Document ID to delete
+            collection_name: Collection name to delete from (defaults to self.config.collection_name)
+
+        Returns:
+            Tuple of (success: bool, message: str)
+        """
         if not doc_id:
             return False, "Document ID cannot be empty."
+
+        # Use provided collection_name or fall back to config
+        coll_name = collection_name or self.config.collection_name
 
         try:
             # Delete from vector store
             if self.vector_store:
-                # Get all chunk IDs for this document
+                # Get all chunk IDs for this document in the specified collection
                 if self.engine:
                     with self.engine.connect() as conn:
                         result = conn.execute(
-                            text("SELECT chunk_id FROM document_chunks WHERE document_id = :doc_id"),
-                            {"doc_id": doc_id}
+                            text("SELECT chunk_id FROM document_chunks WHERE document_id = :doc_id AND collection_name = :coll_name"),
+                            {"doc_id": doc_id, "coll_name": coll_name}
                         )
                         chunk_ids = [row[0] for row in result]
 
@@ -348,14 +359,14 @@ class IngestionHandler:
                             # Delete from vector store
                             self.vector_store.delete(chunk_ids)
 
-                        # Delete from document_chunks table
+                        # Delete from document_chunks table (only for this collection)
                         conn.execute(
-                            text("DELETE FROM document_chunks WHERE document_id = :doc_id"),
-                            {"doc_id": doc_id}
+                            text("DELETE FROM document_chunks WHERE document_id = :doc_id AND collection_name = :coll_name"),
+                            {"doc_id": doc_id, "coll_name": coll_name}
                         )
                         conn.commit()
 
-            return True, f"Successfully deleted document: {doc_id}"
+            return True, f"Successfully deleted document: {doc_id} from collection: {coll_name}"
 
         except Exception as e:
             return False, f"Error deleting document: {str(e)}"

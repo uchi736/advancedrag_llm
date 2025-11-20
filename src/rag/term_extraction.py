@@ -316,10 +316,22 @@ class TermExtractor:
         async def extract_from_chunk(i: int, chunk: str):
             """1つのチャンクから候補を抽出"""
             try:
+                # Trace only the first chunk to avoid excessive LangSmith requests
+                from langchain_core.runnables import RunnableConfig
+                config = RunnableConfig(
+                    run_name=f"[TermExtraction] Stage1-CandidateExtraction",
+                    tags=["term_extraction", "stage1", "sample"],
+                    metadata={
+                        "chunk_index": i,
+                        "total_chunks": len(chunks),
+                        "is_sample": True
+                    }
+                ) if i == 0 else None
+
                 result = await chain.ainvoke({
                     "text": chunk,
                     "format_instructions": self.json_parser.get_format_instructions()
-                })
+                }, config=config)
 
                 # 結果の処理
                 if hasattr(result, "terms"):
@@ -515,11 +527,24 @@ class TermExtractor:
                 """単一バッチを処理"""
                 candidates_json = json.dumps(batch, ensure_ascii=False, indent=2)
 
+                # Trace only the first batch to avoid excessive LangSmith requests
+                from langchain_core.runnables import RunnableConfig
+                config = RunnableConfig(
+                    run_name=f"[TermExtraction] Stage2-TechnicalTermFilter",
+                    tags=["term_extraction", "stage2", "sample"],
+                    metadata={
+                        "batch_index": batch_idx,
+                        "total_batches": total_batches,
+                        "batch_size": len(batch),
+                        "is_sample": True
+                    }
+                ) if batch_idx == 0 else None
+
                 chain = self.technical_term_filter_prompt | self.llm | filter_parser
                 result = await chain.ainvoke({
                     "candidates_json": candidates_json,
                     "format_instructions": filter_parser.get_format_instructions()
-                })
+                }, config=config)
 
                 # 結果の処理
                 selected_terms = []
@@ -675,7 +700,44 @@ class TermExtractor:
                 return term
 
         # 並列実行（プログレスバー付き）
-        tasks = [generate_definition(term) for term in technical_terms]
+        # Wrap only the first term with RunnableConfig for tracing
+        async def generate_with_tracing(idx: int, term: Dict) -> Dict:
+            """定義生成をトレース付きでラップ（最初の1つのみ）"""
+            if idx == 0:
+                # Trace only the first term to avoid excessive LangSmith requests
+                from langchain_core.runnables import RunnableConfig
+                config = RunnableConfig(
+                    run_name=f"[TermExtraction] Stage3-DefinitionGeneration",
+                    tags=["term_extraction", "stage3", "sample"],
+                    metadata={
+                        "term_index": idx,
+                        "total_terms": len(technical_terms),
+                        "headword": term.get("headword", ""),
+                        "is_sample": True
+                    }
+                )
+                # Override chain.ainvoke to use config for this call only
+                headword = term.get("headword", "")
+                if headword:
+                    if use_hybrid:
+                        docs = await self.hybrid_retriever.aget_relevant_documents(headword, config=config)
+                    else:
+                        docs = self.vector_store.similarity_search(headword, k=5)
+
+                    if docs:
+                        context = "\n\n".join([doc.page_content for doc in docs])[:3000]
+                        definition = await chain.ainvoke({
+                            "term": headword,
+                            "context": context
+                        }, config=config)
+                        term["definition"] = definition.strip()
+                    else:
+                        term["definition"] = f"{headword}（関連文書が見つかりません）"
+                return term
+            else:
+                return await generate_definition(term)
+
+        tasks = [generate_with_tracing(i, term) for i, term in enumerate(technical_terms)]
 
         results = []
         with tqdm(total=len(tasks), desc="定義生成", unit="用語", ncols=80) as pbar:
@@ -736,10 +798,21 @@ class TermExtractor:
             )
 
             # LLMで専門用語のグループ化
+            # Always trace Stage4 since it's only called once
+            from langchain_core.runnables import RunnableConfig
+            config = RunnableConfig(
+                run_name=f"[TermExtraction] Stage4-SynonymGrouping",
+                tags=["term_extraction", "stage4"],
+                metadata={
+                    "total_terms": len(terms),
+                    "description": "Groups technical terms into synonym clusters"
+                }
+            )
+
             chain = self.term_synonym_grouping_prompt | self.llm
             result = await chain.ainvoke({
                 "technical_terms_json": technical_terms_json
-            })
+            }, config=config)
 
             # 結果のパース
             if hasattr(result, "content"):

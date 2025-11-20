@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import time
 from sqlalchemy import text
-from src.utils.helpers import _persist_uploaded_file, get_documents_dataframe
+from src.utils.helpers import _persist_uploaded_file, get_documents_dataframe, create_empty_collection, delete_collection
 
 def _get_available_collections(rag_system):
     """Get list of available collections from database"""
@@ -26,37 +26,93 @@ def render_documents_tab(rag_system):
 
     st.markdown("### 📤 ドキュメントアップロード")
 
-    # Collection selection UI
-    st.markdown("#### 📂 保存先コレクション")
+    # Collection management UI
+    st.markdown("#### 📂 コレクション管理")
 
-    col1, col2 = st.columns([3, 1])
+    available_collections = _get_available_collections(rag_system)
+    current_collection = st.session_state.get("selected_collection", rag_system.config.collection_name)
+
+    col1, col2, col3 = st.columns([4, 1, 1])
 
     with col1:
-        # Get available collections
-        available_collections = _get_available_collections(rag_system)
-
-        # New collection or existing collection
-        use_new_collection = st.checkbox("新規コレクションを作成", key="use_new_collection")
-
-        if use_new_collection:
-            selected_collection = st.text_input(
-                "新規コレクション名",
-                placeholder="例: 技術文書, 営業資料, 法務文書",
-                key="new_collection_name"
-            )
-        else:
-            current_collection = st.session_state.get("selected_collection", rag_system.config.collection_name)
-            selected_collection = st.selectbox(
-                "既存のコレクションを選択",
-                available_collections,
-                index=available_collections.index(current_collection) if current_collection in available_collections else 0,
-                key="existing_collection_selector"
-            )
+        selected_collection = st.selectbox(
+            "保存先コレクションを選択",
+            available_collections,
+            index=available_collections.index(current_collection) if current_collection in available_collections else 0,
+            key="collection_selector"
+        )
 
     with col2:
-        st.markdown("<br><br>", unsafe_allow_html=True)
-        if selected_collection:
-            st.info(f"**保存先:**\n{selected_collection}")
+        if st.button("➕ 新規作成", use_container_width=True, key="create_collection_btn"):
+            st.session_state.show_create_dialog = True
+
+    with col3:
+        if st.button("🗑️ 削除", use_container_width=True, key="delete_collection_btn", type="secondary"):
+            st.session_state.show_delete_dialog = True
+
+    # Create collection dialog
+    if st.session_state.get("show_create_dialog", False):
+        @st.dialog("新規コレクション作成")
+        def create_collection_dialog():
+            new_collection_name = st.text_input(
+                "コレクション名を入力",
+                placeholder="例: 技術文書, 営業資料, 法務文書",
+                key="new_collection_input"
+            )
+
+            col_a, col_b = st.columns(2)
+            with col_a:
+                if st.button("作成", type="primary", use_container_width=True):
+                    if new_collection_name:
+                        if new_collection_name in available_collections:
+                            st.error(f"コレクション '{new_collection_name}' は既に存在します。")
+                        else:
+                            if create_empty_collection(rag_system, new_collection_name):
+                                st.success(f"コレクション '{new_collection_name}' を作成しました。")
+                                st.session_state.selected_collection = new_collection_name
+                                st.session_state.show_create_dialog = False
+                                if "rag_system" in st.session_state:
+                                    del st.session_state["rag_system"]
+                                st.rerun()
+                    else:
+                        st.error("コレクション名を入力してください。")
+            with col_b:
+                if st.button("キャンセル", use_container_width=True):
+                    st.session_state.show_create_dialog = False
+                    st.rerun()
+
+        create_collection_dialog()
+
+    # Delete collection dialog
+    if st.session_state.get("show_delete_dialog", False):
+        @st.dialog("コレクション削除")
+        def delete_collection_dialog():
+            st.warning(f"⚠️ コレクション **'{current_collection}'** を削除しますか？")
+            st.error("この操作は取り消せません。コレクション内のすべてのドキュメントとデータが削除されます。")
+
+            col_a, col_b = st.columns(2)
+            with col_a:
+                if st.button("削除する", type="primary", use_container_width=True):
+                    delete_collection(rag_system, current_collection)
+                    st.session_state.show_delete_dialog = False
+                    # Switch to first available collection or default
+                    remaining_collections = _get_available_collections(rag_system)
+                    if remaining_collections:
+                        st.session_state.selected_collection = remaining_collections[0]
+                    else:
+                        st.session_state.selected_collection = "documents"
+                    if "rag_system" in st.session_state:
+                        del st.session_state["rag_system"]
+                    st.rerun()
+            with col_b:
+                if st.button("キャンセル", use_container_width=True):
+                    st.session_state.show_delete_dialog = False
+                    st.rerun()
+
+        delete_collection_dialog()
+
+    # Show current collection status
+    st.info(f"**現在の保存先:** {current_collection}")
 
     # Collection change handling
     if selected_collection and selected_collection != st.session_state.get("selected_collection"):

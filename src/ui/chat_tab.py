@@ -6,12 +6,48 @@ from io import StringIO
 from langchain_core.runnables import RunnableConfig
 from typing import Dict, Any
 from src.utils.helpers import render_sql_result_in_chat
+from sqlalchemy import text
+
+def _get_available_collections(rag_system):
+    """Get list of available collections from database"""
+    try:
+        with rag_system.engine.connect() as conn:
+            result = conn.execute(text("""
+                SELECT DISTINCT collection_name
+                FROM document_chunks
+                ORDER BY collection_name
+            """))
+            collections = [row[0] for row in result]
+            return collections if collections else [rag_system.config.collection_name]
+    except Exception as e:
+        return [rag_system.config.collection_name]
 
 def render_chat_tab(rag_system):
     """Renders the chat tab."""
     if not rag_system:
         st.info("🔧 RAGシステムが初期化されていません。サイドバーでAzure OpenAI APIキーを設定し、「Apply Settings」をクリックするか、データベース設定を確認してください。")
         return
+
+    # Collection selection UI
+    with st.expander("📂 対象コレクション", expanded=False):
+        available_collections = _get_available_collections(rag_system)
+        current_collection = st.session_state.get("selected_collection", rag_system.config.collection_name)
+
+        selected_collection = st.selectbox(
+            "検索対象のコレクションを選択",
+            available_collections,
+            index=available_collections.index(current_collection) if current_collection in available_collections else 0,
+            key="chat_collection_selector"
+        )
+
+        if selected_collection and selected_collection != st.session_state.get("selected_collection"):
+            st.session_state.selected_collection = selected_collection
+            if "rag_system" in st.session_state:
+                del st.session_state["rag_system"]
+            st.rerun()
+
+        st.info(f"**現在の対象:** {current_collection}")
+        st.caption("💡 新規コレクション作成は「📤 ドキュメントアップロード」タブで行えます")
 
     _render_bulk_query_section(rag_system)
 

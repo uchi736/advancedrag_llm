@@ -52,7 +52,14 @@ def get_documents_dataframe(rag: RAGSystem) -> pd.DataFrame:
     try:
         engine = create_engine(rag.connection_string)
         with engine.connect() as conn:
-            query = text("SELECT document_id, COUNT(*) as chunk_count, MAX(created_at) as last_updated FROM document_chunks WHERE collection_name = :collection GROUP BY document_id ORDER BY last_updated DESC")
+            query = text("""
+                SELECT document_id, COUNT(*) as chunk_count, MAX(created_at) as last_updated
+                FROM document_chunks
+                WHERE collection_name = :collection
+                  AND document_id NOT LIKE '__collection_marker_%'
+                GROUP BY document_id
+                ORDER BY last_updated DESC
+            """)
             result = conn.execute(query, {"collection": rag.config.collection_name})
             df = pd.DataFrame(result.fetchall(), columns=["Document ID", "Chunks", "Last Updated"])
         if not df.empty and "Last Updated" in df.columns:
@@ -286,3 +293,70 @@ def cosine_similarity(vec1, vec2):
     similarity = dot_product / (norm1 @ norm2.T + 1e-10)
 
     return similarity
+
+def create_empty_collection(rag_system, collection_name: str) -> bool:
+    """
+    Create an empty collection by inserting a dummy record into document_chunks.
+    Returns True if successful, False otherwise.
+    """
+    try:
+        with rag_system.engine.connect() as conn:
+            # Insert a dummy record with NULL content to mark collection existence
+            conn.execute(text("""
+                INSERT INTO document_chunks (document_id, chunk_id, content, collection_name, created_at)
+                VALUES (:doc_id, :chunk_id, :content, :collection_name, :created_at)
+            """), {
+                "doc_id": f"__collection_marker_{collection_name}__",
+                "chunk_id": f"__collection_marker_{collection_name}___chunk_0",
+                "content": "",  # Empty string instead of NULL to satisfy NOT NULL constraint
+                "collection_name": collection_name,
+                "created_at": datetime.now()
+            })
+            conn.commit()
+        return True
+    except Exception as e:
+        st.error(f"コレクション作成エラー: {e}")
+        return False
+
+def delete_collection(rag_system, collection_name: str) -> int:
+    """
+    Delete all records for a collection from all relevant tables.
+    Returns the total number of records deleted.
+    """
+    try:
+        total_deleted = 0
+
+        with rag_system.engine.connect() as conn:
+            # Delete from document_chunks
+            result = conn.execute(text("""
+                DELETE FROM document_chunks WHERE collection_name = :collection_name
+            """), {"collection_name": collection_name})
+            chunks_deleted = result.rowcount
+            total_deleted += chunks_deleted
+
+            # Delete from langchain_pg_embedding (if collection_name is stored in cmetadata)
+            result = conn.execute(text("""
+                DELETE FROM langchain_pg_embedding
+                WHERE cmetadata->>'collection_name' = :collection_name
+            """), {"collection_name": collection_name})
+            embeddings_deleted = result.rowcount
+            total_deleted += embeddings_deleted
+
+            # Delete from jargon_dictionary if it has collection_name column
+            try:
+                result = conn.execute(text("""
+                    DELETE FROM jargon_dictionary WHERE collection_name = :collection_name
+                """), {"collection_name": collection_name})
+                jargon_deleted = result.rowcount
+                total_deleted += jargon_deleted
+            except Exception:
+                # Table might not have collection_name column, skip
+                pass
+
+            conn.commit()
+
+        st.success(f"コレクション '{collection_name}' を削除しました (削除レコード数: {total_deleted})")
+        return total_deleted
+    except Exception as e:
+        st.error(f"コレクション削除エラー: {e}")
+        return 0

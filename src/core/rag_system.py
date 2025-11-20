@@ -553,7 +553,7 @@ class RAGSystem:
         return self.jargon_manager.delete_terms(terms)
 
     def delete_document_by_id(self, doc_id: str) -> tuple[bool, str]:
-        """Delete a document by its ID.
+        """Delete a document by its ID from the current collection.
 
         Args:
             doc_id: Document ID to delete
@@ -564,7 +564,7 @@ class RAGSystem:
         if not hasattr(self, 'ingestion_handler') or self.ingestion_handler is None:
             return False, "Ingestion handler not available"
 
-        return self.ingestion_handler.delete_document_by_id(doc_id)
+        return self.ingestion_handler.delete_document_by_id(doc_id, self.config.collection_name)
 
     def ingest_documents(self, paths: List[str]) -> None:
         """Ingest documents into the vector store.
@@ -824,30 +824,22 @@ class RAGSystem:
             return result
 
     async def extract_terms(self, input_dir: str | Path, output_json: str | Path) -> None:
-        """Extract terms with LangSmith tracing disabled to avoid excessive requests."""
-        import os
+        """Extract terms from documents.
+
+        Note: Only the first sample of each stage will be traced to LangSmith
+        to avoid excessive requests while still allowing validation of the pipeline.
+        """
         from src.rag.term_extraction import run_extraction_pipeline
 
-        # Temporarily disable LangSmith tracing for term extraction
-        original_tracing = os.environ.get("LANGCHAIN_TRACING_V2")
-        os.environ["LANGCHAIN_TRACING_V2"] = "false"
-
-        try:
-            # Use connection_string only if using PGVector, otherwise pass None
-            pg_url = self.connection_string
-            await run_extraction_pipeline(
-                Path(input_dir), Path(output_json),
-                self.config, self.llm, self.embeddings,
-                self.vector_store, pg_url, self.config.jargon_table_name,
-                jargon_manager=None
-            )
-            print(f"[TermExtractor] Extraction complete -> {output_json}")
-        finally:
-            # Restore original tracing setting
-            if original_tracing is not None:
-                os.environ["LANGCHAIN_TRACING_V2"] = original_tracing
-            else:
-                os.environ.pop("LANGCHAIN_TRACING_V2", None)
+        # Use connection_string only if using PGVector, otherwise pass None
+        pg_url = self.connection_string
+        await run_extraction_pipeline(
+            Path(input_dir), Path(output_json),
+            self.config, self.llm, self.embeddings,
+            self.vector_store, pg_url, self.config.jargon_table_name,
+            jargon_manager=None
+        )
+        print(f"[TermExtractor] Extraction complete -> {output_json}")
 
     # --- Evaluation Methods ---
     def initialize_evaluator(self,

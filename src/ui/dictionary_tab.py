@@ -10,6 +10,20 @@ from src.rag.term_extraction import JargonDictionaryManager
 from src.rag.config import Config
 from src.utils.helpers import render_term_card
 
+def _get_available_collections(rag_system):
+    """Get list of available collections from database"""
+    try:
+        with rag_system.engine.connect() as conn:
+            result = conn.execute(text("""
+                SELECT DISTINCT collection_name
+                FROM document_chunks
+                ORDER BY collection_name
+            """))
+            collections = [row[0] for row in result]
+            return collections if collections else [rag_system.config.collection_name]
+    except Exception as e:
+        return [rag_system.config.collection_name]
+
 @st.cache_data(ttl=60, show_spinner=False)
 def get_all_terms_cached(_jargon_manager):
     return pd.DataFrame(_jargon_manager.get_all_terms())
@@ -57,6 +71,29 @@ def render_dictionary_tab(rag_system):
         return
 
     jargon_manager = rag_system.jargon_manager
+
+    # Collection selection UI
+    with st.expander("📂 対象コレクション", expanded=False):
+        available_collections = _get_available_collections(rag_system)
+        current_collection = st.session_state.get("selected_collection", rag_system.config.collection_name)
+
+        selected_collection = st.selectbox(
+            "専門用語抽出の対象コレクションを選択",
+            available_collections,
+            index=available_collections.index(current_collection) if current_collection in available_collections else 0,
+            key="dictionary_collection_selector"
+        )
+
+        if selected_collection and selected_collection != st.session_state.get("selected_collection"):
+            st.session_state.selected_collection = selected_collection
+            if "rag_system" in st.session_state:
+                del st.session_state["rag_system"]
+            # Clear cached terms
+            get_all_terms_cached.clear()
+            st.rerun()
+
+        st.info(f"**現在の対象:** {current_collection}")
+        st.caption("💡 新規コレクション作成は「📤 ドキュメントアップロード」タブで行えます")
 
     # Manual term registration form
     with st.expander("➕ 新しい用語を手動で登録する"):
@@ -172,8 +209,9 @@ def render_dictionary_tab(rag_system):
                         result = conn.execute(text("""
                             SELECT content
                             FROM document_chunks
+                            WHERE collection_name = :collection_name
                             ORDER BY created_at
-                        """))
+                        """), {"collection_name": rag_system.config.collection_name})
                         all_chunks = [row[0] for row in result]
 
                     if not all_chunks:

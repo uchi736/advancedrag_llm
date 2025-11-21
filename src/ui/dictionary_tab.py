@@ -234,7 +234,9 @@ def render_dictionary_tab(rag_system):
                         output_path.parent.mkdir(parents=True, exist_ok=True)
 
                         with st.spinner("用語抽出中... (LLMベースの処理)"):
-                            asyncio.run(rag_system.extract_terms(input_path, str(output_path)))
+                            # Get latest rag_system from session state to ensure correct collection_name
+                            current_rag = st.session_state.get("rag_system", rag_system)
+                            asyncio.run(current_rag.extract_terms(input_path, str(output_path)))
 
                         st.session_state['term_extraction_output'] = str(output_path)
                         st.success(f"✅ 用語辞書を生成しました → {output_path}")
@@ -255,7 +257,9 @@ def render_dictionary_tab(rag_system):
                         output_path.parent.mkdir(parents=True, exist_ok=True)
 
                         with st.spinner("用語抽出中... (LLMベースの処理)"):
-                            asyncio.run(rag_system.extract_terms(input_path, str(output_path)))
+                            # Get latest rag_system from session state to ensure correct collection_name
+                            current_rag = st.session_state.get("rag_system", rag_system)
+                            asyncio.run(current_rag.extract_terms(input_path, str(output_path)))
 
                         st.session_state['term_extraction_output'] = str(output_path)
                         st.success(f"✅ 用語辞書を生成しました → {output_path}")

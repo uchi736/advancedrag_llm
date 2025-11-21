@@ -31,8 +31,17 @@ def initialize_session_state():
         st.session_state.selected_collection = os.getenv("COLLECTION_NAME", "documents")
 
 @st.cache_resource(show_spinner=False)
-def initialize_rag_system(config_obj: Config) -> RAGSystem:
-    """Cached function to initialize the RAGSystem."""
+def initialize_rag_system(collection_name: str, config_obj: Config) -> RAGSystem:
+    """Cached function to initialize the RAGSystem.
+
+    Args:
+        collection_name: Collection name (used for cache key to ensure different
+                        collections get separate RAGSystem instances)
+        config_obj: Configuration object
+
+    Returns:
+        RAGSystem instance configured for the specified collection
+    """
     return RAGSystem(config_obj)
 
 def get_rag_system():
@@ -65,7 +74,7 @@ def get_rag_system():
                     final_k=int(os.getenv("FINAL_K", 5)),
                     enable_jargon_augmentation=st.session_state.use_jargon_augmentation
                 )
-                st.session_state.rag_system = initialize_rag_system(app_config)
+                st.session_state.rag_system = initialize_rag_system(collection_name, app_config)
                 st.toast("✅ RAGシステムがAzure OpenAIで正常に初期化されました", icon="🎉")
             except Exception as e:
                 st.error(f"Azure RAGシステムの初期化中にエラーが発生しました: {type(e).__name__} - {e}")

@@ -211,6 +211,9 @@ class TermExtractor:
                 pool_recycle=3600       # 1時間で接続をリサイクル
             )
             logger.info(f"Database engine created with pool_size=20, max_overflow=30")
+
+            # テーブルスキーマの初期化（collection_name列の追加）
+            self._init_jargon_table()
         else:
             self.engine = None
 
@@ -244,6 +247,30 @@ class TermExtractor:
             self.pdf_processor = AzureDocumentIntelligenceProcessor(config)
         except Exception as e:
             logger.warning(f"PDF processor initialization failed: {e}")
+
+    def _init_jargon_table(self):
+        """専門用語辞書テーブルの初期化（collection_name列のマイグレーション）"""
+        if not self.engine:
+            return
+
+        try:
+            with self.engine.connect() as conn:
+                # Add collection_name column if it doesn't exist
+                conn.execute(text(f"""
+                    DO $$
+                    BEGIN
+                        IF NOT EXISTS (
+                            SELECT 1 FROM information_schema.columns
+                            WHERE table_name = '{self.jargon_table_name}' AND column_name = 'collection_name'
+                        ) THEN
+                            ALTER TABLE {self.jargon_table_name} ADD COLUMN collection_name TEXT NOT NULL DEFAULT 'documents';
+                        END IF;
+                    END $$;
+                """))
+                conn.commit()
+                logger.info(f"TermExtractor: jargon table schema initialized for collection_name support")
+        except Exception as e:
+            logger.warning(f"TermExtractor: Failed to initialize jargon table schema: {e}")
 
     def _init_prompts(self):
         """プロンプトの初期化"""

@@ -238,7 +238,7 @@ def render_dictionary_tab(rag_system):
 
                         st.session_state['term_extraction_output'] = str(output_path)
                         st.success(f"✅ 用語辞書を生成しました → {output_path}")
-                                                get_all_terms_cached.clear()
+                        get_all_terms_cached.clear()
                         st.rerun()
                 else:
                     if not uploaded_files:
@@ -259,7 +259,7 @@ def render_dictionary_tab(rag_system):
 
                         st.session_state['term_extraction_output'] = str(output_path)
                         st.success(f"✅ 用語辞書を生成しました → {output_path}")
-                                                get_all_terms_cached.clear()
+                        get_all_terms_cached.clear()
                         st.rerun()
 
             except Exception as e:

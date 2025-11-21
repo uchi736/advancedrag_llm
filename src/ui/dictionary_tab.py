@@ -84,8 +84,10 @@ def render_dictionary_tab(rag_system):
             key="dictionary_collection_selector"
         )
 
-        if selected_collection and selected_collection != st.session_state.get("selected_collection"):
+        if (selected_collection and selected_collection != st.session_state.get("selected_collection")) or \
+           st.session_state.get("force_collection_switch", False):
             st.session_state.selected_collection = selected_collection
+            st.session_state.force_collection_switch = False  # Clear flag after processing
             if "rag_system" in st.session_state:
                 del st.session_state["rag_system"]
             # Clear cached terms

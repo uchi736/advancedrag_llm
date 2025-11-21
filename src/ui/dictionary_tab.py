@@ -65,14 +65,7 @@ def render_dictionary_tab(rag_system):
         st.warning("⚠️ RAGシステムが初期化されていません。")
         return
 
-    # Check if jargon manager is available
-    if not hasattr(rag_system, 'jargon_manager') or rag_system.jargon_manager is None:
-        st.warning("⚠️ 専門用語辞書機能は現在利用できません。")
-        return
-
-    jargon_manager = rag_system.jargon_manager
-
-    # Collection selection UI
+    # Collection selection UI (before getting jargon_manager)
     with st.expander("📂 対象コレクション", expanded=False):
         available_collections = _get_available_collections(rag_system)
         current_collection = st.session_state.get("selected_collection", rag_system.config.collection_name)
@@ -96,6 +89,13 @@ def render_dictionary_tab(rag_system):
 
         st.info(f"**現在の対象:** {current_collection}")
         st.caption("💡 新規コレクション作成は「📤 ドキュメントアップロード」タブで行えます")
+
+    # Check if jargon manager is available (after collection switch handling)
+    if not hasattr(rag_system, 'jargon_manager') or rag_system.jargon_manager is None:
+        st.warning("⚠️ 専門用語辞書機能は現在利用できません。")
+        return
+
+    jargon_manager = rag_system.jargon_manager
 
     # Manual term registration form
     with st.expander("➕ 新しい用語を手動で登録する"):

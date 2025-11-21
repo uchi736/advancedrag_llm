@@ -838,7 +838,8 @@ class RAGSystem:
             Path(input_dir), Path(output_json),
             self.config, self.llm, self.embeddings,
             self.vector_store, pg_url, self.config.jargon_table_name,
-            jargon_manager=None
+            jargon_manager=None,
+            collection_name=self.config.collection_name
         )
         print(f"[TermExtractor] Extraction complete -> {output_json}")
 

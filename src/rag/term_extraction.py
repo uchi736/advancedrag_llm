@@ -191,13 +191,14 @@ class JargonDictionaryManager:
 class TermExtractor:
     """LLMベースのシンプルな専門用語抽出クラス"""
 
-    def __init__(self, config, llm, embeddings, vector_store, pg_url, jargon_table_name):
+    def __init__(self, config, llm, embeddings, vector_store, pg_url, jargon_table_name, collection_name="documents"):
         self.config = config
         self.llm = llm
         self.embeddings = embeddings
         self.vector_store = vector_store
         self.pg_url = pg_url
         self.jargon_table_name = jargon_table_name
+        self.collection_name = collection_name
 
         # データベース接続（接続プール設定を最適化）
         if pg_url:
@@ -1002,9 +1003,9 @@ class TermExtractor:
                 try:
                     conn.execute(
                         text(f"""
-                            INSERT INTO {self.jargon_table_name} (term, definition, aliases)
-                            VALUES (:term, :definition, :aliases)
-                            ON CONFLICT (term) DO UPDATE
+                            INSERT INTO {self.jargon_table_name} (term, definition, aliases, collection_name)
+                            VALUES (:term, :definition, :aliases, :collection_name)
+                            ON CONFLICT (term, collection_name) DO UPDATE
                             SET definition = EXCLUDED.definition,
                                 aliases = EXCLUDED.aliases,
                                 updated_at = CURRENT_TIMESTAMP
@@ -1012,7 +1013,8 @@ class TermExtractor:
                         {
                             "term": term.get("headword"),
                             "definition": term.get("definition", ""),
-                            "aliases": term.get("synonyms", [])
+                            "aliases": term.get("synonyms", []),
+                            "collection_name": self.collection_name
                         }
                     )
                     saved_count += 1
@@ -1024,9 +1026,9 @@ class TermExtractor:
 
 
 # ========== Utility Functions ==========
-async def run_extraction_pipeline(input_dir: Path, output_json: Path, config, llm, embeddings, vector_store, pg_url, jargon_table_name, jargon_manager=None):
+async def run_extraction_pipeline(input_dir: Path, output_json: Path, config, llm, embeddings, vector_store, pg_url, jargon_table_name, jargon_manager=None, collection_name="documents"):
     """専門用語抽出パイプラインの実行"""
-    extractor = TermExtractor(config, llm, embeddings, vector_store, pg_url, jargon_table_name)
+    extractor = TermExtractor(config, llm, embeddings, vector_store, pg_url, jargon_table_name, collection_name=collection_name)
 
     # ファイルの検索
     supported_exts = ['.txt', '.md', '.pdf']

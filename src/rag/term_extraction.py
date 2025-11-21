@@ -90,6 +90,28 @@ class JargonDictionaryManager:
                 END $$;
             """))
 
+            # Update UNIQUE constraint from (term) to (term, collection_name)
+            conn.execute(text(f"""
+                DO $$
+                BEGIN
+                    -- Drop old UNIQUE constraint on (term) if it exists
+                    IF EXISTS (
+                        SELECT 1 FROM pg_constraint
+                        WHERE conname = '{self.table_name}_term_key'
+                    ) THEN
+                        ALTER TABLE {self.table_name} DROP CONSTRAINT {self.table_name}_term_key;
+                    END IF;
+
+                    -- Add new UNIQUE constraint on (term, collection_name) if it doesn't exist
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_constraint
+                        WHERE conname = '{self.table_name}_term_collection_name_key'
+                    ) THEN
+                        ALTER TABLE {self.table_name} ADD CONSTRAINT {self.table_name}_term_collection_name_key UNIQUE (term, collection_name);
+                    END IF;
+                END $$;
+            """))
+
             conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_jargon_term ON {self.table_name} (LOWER(term), collection_name)"))
             conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_jargon_collection ON {self.table_name} (collection_name)"))
             conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_jargon_aliases ON {self.table_name} USING GIN(aliases)"))
@@ -249,7 +271,7 @@ class TermExtractor:
             logger.warning(f"PDF processor initialization failed: {e}")
 
     def _init_jargon_table(self):
-        """専門用語辞書テーブルの初期化（collection_name列のマイグレーション）"""
+        """専門用語辞書テーブルの初期化（collection_name列とUNIQUE制約のマイグレーション）"""
         if not self.engine:
             return
 
@@ -267,8 +289,31 @@ class TermExtractor:
                         END IF;
                     END $$;
                 """))
+
+                # Update UNIQUE constraint from (term) to (term, collection_name)
+                conn.execute(text(f"""
+                    DO $$
+                    BEGIN
+                        -- Drop old UNIQUE constraint on (term) if it exists
+                        IF EXISTS (
+                            SELECT 1 FROM pg_constraint
+                            WHERE conname = '{self.jargon_table_name}_term_key'
+                        ) THEN
+                            ALTER TABLE {self.jargon_table_name} DROP CONSTRAINT {self.jargon_table_name}_term_key;
+                        END IF;
+
+                        -- Add new UNIQUE constraint on (term, collection_name) if it doesn't exist
+                        IF NOT EXISTS (
+                            SELECT 1 FROM pg_constraint
+                            WHERE conname = '{self.jargon_table_name}_term_collection_name_key'
+                        ) THEN
+                            ALTER TABLE {self.jargon_table_name} ADD CONSTRAINT {self.jargon_table_name}_term_collection_name_key UNIQUE (term, collection_name);
+                        END IF;
+                    END $$;
+                """))
+
                 conn.commit()
-                logger.info(f"TermExtractor: jargon table schema initialized for collection_name support")
+                logger.info(f"TermExtractor: jargon table schema initialized with collection_name support and updated UNIQUE constraint")
         except Exception as e:
             logger.warning(f"TermExtractor: Failed to initialize jargon table schema: {e}")
 

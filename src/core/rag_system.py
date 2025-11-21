@@ -201,7 +201,8 @@ class RAGSystem:
         self.jargon_manager = JargonDictionaryManager(
             self.connection_string,
             cfg.jargon_table_name,
-            engine=self.engine
+            engine=self.engine,
+            collection_name=cfg.collection_name
         )
         self.ingestion_handler = IngestionHandler(
             cfg,

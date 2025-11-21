@@ -50,41 +50,61 @@ class FilteredTermResult(BaseModel):
 class JargonDictionaryManager:
     """専門用語辞書の管理クラス（互換性用）"""
 
-    def __init__(self, connection_string: str, table_name: str = "jargon_dictionary", engine: Optional[Engine] = None):
+    def __init__(self, connection_string: str, table_name: str = "jargon_dictionary",
+                 engine: Optional[Engine] = None, collection_name: str = "documents"):
         self.connection_string = connection_string
         self.table_name = table_name
+        self.collection_name = collection_name
         self.engine: Engine = engine or create_engine(connection_string)
         self._init_jargon_table()
 
     def _init_jargon_table(self):
         """専門用語辞書テーブルの初期化"""
         with self.engine.connect() as conn:
+            # Create table with collection_name column
             conn.execute(text(f"""
                 CREATE TABLE IF NOT EXISTS {self.table_name} (
                     id SERIAL PRIMARY KEY,
-                    term TEXT UNIQUE NOT NULL,
+                    term TEXT NOT NULL,
                     definition TEXT NOT NULL,
                     domain TEXT,
                     aliases TEXT[],
                     related_terms TEXT[],
+                    collection_name TEXT NOT NULL DEFAULT 'documents',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(term, collection_name)
                 )
             """))
-            conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_jargon_term ON {self.table_name} (LOWER(term))"))
+
+            # Add collection_name column if it doesn't exist (for existing tables)
+            conn.execute(text(f"""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM information_schema.columns
+                        WHERE table_name = '{self.table_name}' AND column_name = 'collection_name'
+                    ) THEN
+                        ALTER TABLE {self.table_name} ADD COLUMN collection_name TEXT NOT NULL DEFAULT 'documents';
+                    END IF;
+                END $$;
+            """))
+
+            conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_jargon_term ON {self.table_name} (LOWER(term), collection_name)"))
+            conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_jargon_collection ON {self.table_name} (collection_name)"))
             conn.execute(text(f"CREATE INDEX IF NOT EXISTS idx_jargon_aliases ON {self.table_name} USING GIN(aliases)"))
             conn.commit()
 
     def add_term(self, term: str, definition: str, domain: Optional[str] = None,
                  aliases: Optional[List[str]] = None, related_terms: Optional[List[str]] = None) -> bool:
-        """用語を辞書に追加または更新"""
+        """用語を辞書に追加または更新（現在のコレクション内）"""
         try:
             with self.engine.connect() as conn:
                 conn.execute(text(f"""
                     INSERT INTO {self.table_name}
-                    (term, definition, domain, aliases, related_terms)
-                    VALUES (:term, :definition, :domain, :aliases, :related_terms)
-                    ON CONFLICT (term) DO UPDATE SET
+                    (term, definition, domain, aliases, related_terms, collection_name)
+                    VALUES (:term, :definition, :domain, :aliases, :related_terms, :collection_name)
+                    ON CONFLICT (term, collection_name) DO UPDATE SET
                         definition = EXCLUDED.definition,
                         domain = EXCLUDED.domain,
                         aliases = EXCLUDED.aliases,
@@ -92,7 +112,8 @@ class JargonDictionaryManager:
                         updated_at = CURRENT_TIMESTAMP
                 """), {
                     "term": term, "definition": definition, "domain": domain,
-                    "aliases": aliases or [], "related_terms": related_terms or []
+                    "aliases": aliases or [], "related_terms": related_terms or [],
+                    "collection_name": self.collection_name
                 })
                 conn.commit()
             return True
@@ -101,7 +122,7 @@ class JargonDictionaryManager:
             return False
 
     def lookup_terms(self, terms: List[str]) -> Dict[str, Dict[str, Any]]:
-        """複数の用語を辞書から検索"""
+        """複数の用語を辞書から検索（現在のコレクション内）"""
         if not terms:
             return {}
 
@@ -112,11 +133,12 @@ class JargonDictionaryManager:
                 query = text(f"""
                     SELECT term, definition, domain, aliases, related_terms
                     FROM {self.table_name}
-                    WHERE LOWER(term) IN ({placeholders})
-                    OR term = ANY(:aliases_check)
+                    WHERE collection_name = :collection_name
+                      AND (LOWER(term) IN ({placeholders}) OR term = ANY(:aliases_check))
                 """)
                 params = {f"term_{i}": term.lower() for i, term in enumerate(terms)}
                 params["aliases_check"] = terms
+                params["collection_name"] = self.collection_name
 
                 rows = conn.execute(query, params).fetchall()
                 for row in rows:
@@ -129,7 +151,7 @@ class JargonDictionaryManager:
         return results
 
     def delete_terms(self, terms: List[str]) -> tuple[int, int]:
-        """複数の用語を一括削除"""
+        """複数の用語を一括削除（現在のコレクション内のみ）"""
         if not terms:
             return 0, 0
 
@@ -142,8 +164,8 @@ class JargonDictionaryManager:
                         errors += 1
                         continue
                     result = conn.execute(
-                        text(f"DELETE FROM {self.table_name} WHERE term = :term"),
-                        {"term": term}
+                        text(f"DELETE FROM {self.table_name} WHERE term = :term AND collection_name = :collection_name"),
+                        {"term": term, "collection_name": self.collection_name}
                     )
                     deleted += result.rowcount or 0
         except Exception as e:
@@ -152,10 +174,13 @@ class JargonDictionaryManager:
         return deleted, errors
 
     def get_all_terms(self) -> List[Dict[str, Any]]:
-        """全ての用語を取得"""
+        """全ての用語を取得（現在のコレクション内のみ）"""
         try:
             with self.engine.connect() as conn:
-                result = conn.execute(text(f"SELECT * FROM {self.table_name} ORDER BY term")).fetchall()
+                result = conn.execute(
+                    text(f"SELECT * FROM {self.table_name} WHERE collection_name = :collection_name ORDER BY term"),
+                    {"collection_name": self.collection_name}
+                ).fetchall()
                 return [dict(row._mapping) for row in result]
         except Exception as e:
             logger.error(f"Error getting all terms: {e}")

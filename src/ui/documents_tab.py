@@ -158,7 +158,6 @@ def render_documents_tab(rag_system):
                 progress_bar.progress(1.0, text="インジェスト完了！")
                 st.success(f"✅ {len(uploaded_docs)}個のファイルが正常に処理されました！")
                 time.sleep(1)
-                st.balloons()
                 st.rerun()
             except Exception as e:
                 st.error(f"ドキュメント処理中にエラーが発生しました: {type(e).__name__} - {e}")

@@ -745,7 +745,7 @@ class TermExtractor:
                 headword = term.get("headword", "")
                 if headword:
                     if use_hybrid:
-                        docs = await self.hybrid_retriever.aget_relevant_documents(headword, config=config)
+                        docs = await self.hybrid_retriever.aget_relevant_documents(headword)
                     else:
                         docs = self.vector_store.similarity_search(headword, k=5)
 

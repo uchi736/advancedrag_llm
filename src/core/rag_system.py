@@ -204,6 +204,16 @@ class RAGSystem:
             engine=self.engine,
             collection_name=cfg.collection_name
         )
+
+        # Sync jargon terms to vector store for reverse lookup
+        if self.jargon_manager and self.vector_store:
+            try:
+                self.jargon_manager.sync_to_vector_store(self.vector_store, self.embeddings)
+            except Exception as e:
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.warning(f"Failed to sync jargon terms to vector store: {e}")
+
         self.ingestion_handler = IngestionHandler(
             cfg,
             self.vector_store,

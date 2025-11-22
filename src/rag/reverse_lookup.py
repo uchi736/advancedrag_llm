@@ -133,9 +133,29 @@ class ReverseLookupEngine:
             '環境影響': ['environmental impact'],
         }
 
+    @staticmethod
+    def _rrf_score(rank: int, k: int = 60) -> float:
+        """
+        Calculate RRF (Reciprocal Rank Fusion) score.
+        Borrowed from JapaneseHybridRetriever for consistency.
+
+        Args:
+            rank: Rank position (1-indexed)
+            k: RRF constant (default: 60)
+
+        Returns:
+            RRF score
+        """
+        return 1.0 / (k + rank)
+
     def reverse_lookup(self, query: str, top_k: int = 5) -> List[ReverseLookupResult]:
         """
-        Perform reverse lookup to find technical terms from descriptions.
+        Perform hybrid reverse lookup to find technical terms from descriptions.
+
+        Uses a three-phase approach:
+        1. Hybrid search (keyword + vector) with RRF fusion
+        2. Confidence-based filtering
+        3. LLM reranking (if needed for ambiguous cases)
 
         Args:
             query: Description or explanation to lookup
@@ -144,65 +164,253 @@ class ReverseLookupEngine:
         Returns:
             List of ReverseLookupResult objects sorted by confidence
         """
-        results = []
-        seen_terms = set()
+        # Phase 1: Hybrid search
+        keyword_results = self._keyword_search(query, top_k=10)
+        vector_results = self._vector_search(query, top_k=10)
 
-        # Step 1: Exact match in reverse dictionary
+        # Fuse results using RRF
+        fused_results = self._reciprocal_rank_fusion(keyword_results, vector_results)
+
+        # Convert to ReverseLookupResult objects
+        candidates = [
+            ReverseLookupResult(
+                term=term,
+                confidence=score,
+                source='hybrid'
+            )
+            for term, score in fused_results[:15]  # Top 15 candidates
+        ]
+
+        if not candidates:
+            return []
+
+        # Phase 2: Confidence-based filtering
+        high_confidence = [c for c in candidates if c.confidence >= 0.9]
+        medium_confidence = [c for c in candidates if 0.6 <= c.confidence < 0.9]
+
+        # Case 1: High confidence with 1-2 results -> return immediately
+        if 1 <= len(high_confidence) <= 2:
+            logger.info(f"Reverse lookup: {len(high_confidence)} high-confidence results")
+            return high_confidence
+
+        # Case 2: Multiple high or medium confidence results -> use LLM reranking
+        if len(high_confidence) >= 3 or len(medium_confidence) >= 3:
+            logger.info(f"Reverse lookup: using LLM reranking for {len(candidates[:10])} candidates")
+            return self._llm_rerank(query, candidates[:10], top_k)
+
+        # Case 3: Low confidence or few results -> return as is
+        return candidates[:top_k]
+
+    def _keyword_search(self, query: str, top_k: int = 10) -> List[Tuple[str, float]]:
+        """
+        Dictionary-based keyword search for reverse lookup.
+
+        Args:
+            query: Query string
+            top_k: Maximum number of results
+
+        Returns:
+            List of (term, score) tuples
+        """
+        results = {}  # {term: score}
         query_lower = query.lower()
+
+        # 1. Exact match (highest score)
         if query_lower in self.reverse_dict:
             for term in self.reverse_dict[query_lower]:
-                if term not in seen_terms:
-                    results.append(ReverseLookupResult(
-                        term=term,
-                        confidence=1.0,
-                        source='exact'
-                    ))
-                    seen_terms.add(term)
+                results[term] = 1.0
 
-        # Step 2: Partial match in reverse dictionary
-        for key, terms in self.reverse_dict.items():
-            if key in query_lower or query_lower in key:
-                for term in terms:
-                    if term not in seen_terms:
-                        # Calculate confidence based on match quality
-                        confidence = self._calculate_partial_match_confidence(key, query_lower)
-                        results.append(ReverseLookupResult(
-                            term=term,
-                            confidence=confidence,
-                            source='partial'
-                        ))
-                        seen_terms.add(term)
-
-        # Step 3: Pattern-based lookup
+        # 2. Pattern match (high score)
         for pattern, replacements in self.pattern_dict.items():
             if pattern in query:
                 for replacement in replacements:
-                    if replacement not in seen_terms:
-                        results.append(ReverseLookupResult(
-                            term=replacement,
-                            confidence=0.8,
-                            source='pattern'
-                        ))
-                        seen_terms.add(replacement)
+                    if replacement not in results or results[replacement] < 0.85:
+                        results[replacement] = 0.85
 
-        # Step 4: Vector similarity search (if available)
-        if self.vector_store:
-            similar_results = self._similarity_search(query, top_k=10)
-            for term, score in similar_results:
-                if term not in seen_terms:
-                    results.append(ReverseLookupResult(
-                        term=term,
-                        confidence=score,
-                        source='similarity'
-                    ))
-                    seen_terms.add(term)
+        # 3. Partial match (medium score, quality-based)
+        for key, terms in self.reverse_dict.items():
+            if key == query_lower:  # Already handled in exact match
+                continue
 
-        # Sort by confidence and return top_k
-        results.sort(key=lambda x: x.confidence, reverse=True)
-        return results[:top_k]
+            if key in query_lower or query_lower in key:
+                match_ratio = self._calculate_match_ratio(key, query_lower)
+
+                if match_ratio > 0.5:  # High quality partial match only
+                    score = 0.5 + (match_ratio * 0.3)  # 0.5-0.8 range
+
+                    for term in terms:
+                        if term not in results or results[term] < score:
+                            results[term] = score
+
+        # Sort by score
+        ranked = sorted(results.items(), key=lambda x: x[1], reverse=True)
+        return ranked[:top_k]
+
+    def _calculate_match_ratio(self, key: str, query: str) -> float:
+        """Calculate the quality of a partial match"""
+        longer = max(len(key), len(query))
+        shorter = min(len(key), len(query))
+
+        # Match length
+        if key in query:
+            match_len = len(key)
+        elif query in key:
+            match_len = len(query)
+        else:
+            # Common substring length (simplified)
+            match_len = len(set(key) & set(query))
+
+        return match_len / longer if longer > 0 else 0.0
+
+    def _vector_search(self, query: str, top_k: int = 10) -> List[Tuple[str, float]]:
+        """
+        Vector similarity search for jargon term definitions.
+
+        Args:
+            query: Query string
+            top_k: Maximum number of results
+
+        Returns:
+            List of (term, similarity_score) tuples
+        """
+        if not self.vector_store:
+            return []
+
+        try:
+            # Search only jargon terms (not document chunks)
+            filter_dict = {
+                'type': 'jargon_term',
+                'collection_name': self.jargon_manager.collection_name
+            }
+
+            results = self.vector_store.similarity_search_with_score(
+                query,
+                k=top_k,
+                filter=filter_dict
+            )
+
+            term_scores = []
+            for doc, distance in results:
+                # Convert distance to similarity (0-1)
+                similarity = 1 - distance if distance < 1 else 0
+                term = doc.metadata.get('term')
+
+                if term and similarity > 0.3:  # Minimum threshold
+                    term_scores.append((term, similarity))
+
+            return term_scores
+
+        except Exception as e:
+            logger.warning(f"Vector search for reverse lookup failed: {e}")
+            return []
+
+    def _reciprocal_rank_fusion(
+        self,
+        keyword_results: List[Tuple[str, float]],
+        vector_results: List[Tuple[str, float]],
+        k: int = 60
+    ) -> List[Tuple[str, float]]:
+        """
+        Fuse keyword and vector search results using RRF.
+
+        Args:
+            keyword_results: Keyword search results [(term, score), ...]
+            vector_results: Vector search results [(term, score), ...]
+            k: RRF constant (default: 60)
+
+        Returns:
+            Fused results [(term, rrf_score), ...]
+        """
+        rrf_scores = {}
+
+        # Add RRF scores from keyword results
+        for rank, (term, score) in enumerate(keyword_results, start=1):
+            rrf_scores[term] = rrf_scores.get(term, 0.0) + self._rrf_score(rank, k)
+
+        # Add RRF scores from vector results
+        for rank, (term, score) in enumerate(vector_results, start=1):
+            rrf_scores[term] = rrf_scores.get(term, 0.0) + self._rrf_score(rank, k)
+
+        # Normalize to 0-1 range
+        if rrf_scores:
+            max_score = max(rrf_scores.values())
+            rrf_scores = {term: score / max_score for term, score in rrf_scores.items()}
+
+        # Sort by score
+        ranked = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
+
+        return ranked
+
+    def _llm_rerank(
+        self,
+        query: str,
+        candidates: List[ReverseLookupResult],
+        top_k: int = 5
+    ) -> List[ReverseLookupResult]:
+        """
+        Rerank candidates using LLM for final selection.
+
+        Args:
+            query: Original query
+            candidates: Candidate results (typically 10 or fewer)
+            top_k: Number of results to return
+
+        Returns:
+            Reranked results
+        """
+        if not self.llm:
+            logger.warning("LLM not available for reranking")
+            return candidates[:top_k]
+
+        # Extract term list
+        candidate_terms = [c.term for c in candidates]
+
+        # Lightweight prompt to minimize tokens
+        prompt = f"""あなたは技術文書検索の専門家です。
+ユーザークエリに最も関連する専門用語を、候補の中から選んでください。
+
+クエリ: {query}
+
+候補用語:
+{', '.join([f"{i+1}.{term}" for i, term in enumerate(candidate_terms)])}
+
+タスク: 上記の候補から、クエリに最も関連する用語を最大{top_k}件選び、関連度の高い順に番号で答えてください。
+
+出力形式: カンマ区切りの番号（例: 1,3,5）
+回答:"""
+
+        try:
+            response = self.llm.invoke(prompt)
+            selected_indices = self._parse_llm_ranking(response.content)
+
+            # Extract selected terms
+            reranked = []
+            for idx in selected_indices[:top_k]:
+                if 0 <= idx < len(candidates):
+                    result = candidates[idx]
+                    # Boost confidence slightly for LLM-selected terms
+                    result.confidence = min(result.confidence + 0.1, 1.0)
+                    result.source = 'llm_reranked'
+                    reranked.append(result)
+
+            return reranked if reranked else candidates[:top_k]
+
+        except Exception as e:
+            logger.error(f"LLM reranking failed: {e}")
+            return candidates[:top_k]
+
+    def _parse_llm_ranking(self, response: str) -> List[int]:
+        """Parse LLM response to extract ranking numbers"""
+        try:
+            # Expected format: "1,3,5" or similar
+            numbers = [int(x.strip()) - 1 for x in response.strip().split(',')]  # Convert to 0-indexed
+            return numbers
+        except Exception as e:
+            logger.error(f"Failed to parse LLM response: {e}")
+            return []
 
     def _calculate_partial_match_confidence(self, key: str, query: str) -> float:
-        """Calculate confidence score for partial matches"""
+        """Calculate confidence score for partial matches (legacy method)"""
         # Longer matches get higher confidence
         match_length = len(key) if key in query else len(query)
         total_length = max(len(key), len(query))
@@ -216,34 +424,6 @@ class ReverseLookupEngine:
 
         return confidence * 0.7  # Scale down partial matches
 
-    def _similarity_search(self, query: str, top_k: int = 10) -> List[Tuple[str, float]]:
-        """
-        Perform vector similarity search for related terms.
-
-        Returns:
-            List of (term, similarity_score) tuples
-        """
-        try:
-            # Search in vector store with metadata filter for jargon terms
-            results = self.vector_store.similarity_search_with_score(
-                query,
-                k=top_k,
-                filter={"type": "jargon_term"}
-            )
-
-            # Extract terms and scores
-            term_scores = []
-            for doc, score in results:
-                # Convert distance to similarity (assuming cosine distance)
-                similarity = 1 - score if score < 1 else 0
-                term = doc.metadata.get('term', doc.page_content[:50])
-                term_scores.append((term, similarity))
-
-            return term_scores
-
-        except Exception as e:
-            logger.warning(f"Similarity search failed: {e}")
-            return []
 
     def augment_query_with_reverse_lookup(
         self,

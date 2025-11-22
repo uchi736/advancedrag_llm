@@ -195,6 +195,58 @@ class JargonDictionaryManager:
             return deleted, len(terms) - deleted
         return deleted, errors
 
+    def sync_to_vector_store(self, vector_store, embeddings):
+        """
+        専門用語の定義文をベクトルストアに同期
+
+        Args:
+            vector_store: PGVector store instance
+            embeddings: Embeddings instance
+        """
+        from langchain_core.documents import Document
+
+        all_terms = self.get_all_terms()
+
+        if not all_terms:
+            logger.info("No jargon terms to sync to vector store")
+            return
+
+        documents = []
+        for term_data in all_terms:
+            term = term_data.get('term')
+            definition = term_data.get('definition', '')
+            aliases = term_data.get('aliases', [])
+
+            if not term or not definition:
+                continue
+
+            # 用語名 + 類義語 + 定義文の形式で保存
+            if aliases:
+                aliases_str = ', '.join(aliases)
+                content = f"{term} ({aliases_str}): {definition}"
+            else:
+                content = f"{term}: {definition}"
+
+            doc = Document(
+                page_content=content,
+                metadata={
+                    'type': 'jargon_term',  # ドキュメントと区別するための重要なフィールド
+                    'term': term,
+                    'aliases': aliases,
+                    'collection_name': self.collection_name
+                }
+            )
+            documents.append(doc)
+
+        if documents:
+            try:
+                vector_store.add_documents(documents)
+                logger.info(f"Synced {len(documents)} jargon terms to vector store for collection '{self.collection_name}'")
+            except Exception as e:
+                logger.error(f"Failed to sync jargon terms to vector store: {e}")
+        else:
+            logger.warning("No valid jargon term documents to sync")
+
     def get_all_terms(self) -> List[Dict[str, Any]]:
         """全ての用語を取得（現在のコレクション内のみ）"""
         try:

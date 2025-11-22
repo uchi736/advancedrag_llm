@@ -35,12 +35,31 @@ class JapaneseHybridRetriever(BaseRetriever):
         if not self.vector_store:
             return []
         try:
+            # Fetch more results than needed to account for jargon term filtering
+            search_k = self.config_params.vector_search_k * 2
+
             # Check if it's an adapter or native vector store
             if hasattr(self.vector_store, 'similarity_search_with_score'):
-                return self.vector_store.similarity_search_with_score(q, k=self.config_params.vector_search_k)
+                results = self.vector_store.similarity_search_with_score(q, k=search_k)
             elif hasattr(self.vector_store, 'vector_store'):
                 # It's wrapped in an adapter
-                return self.vector_store.vector_store.similarity_search_with_score(q, k=self.config_params.vector_search_k)
+                results = self.vector_store.vector_store.similarity_search_with_score(q, k=search_k)
+            else:
+                return []
+
+            # Filter out jargon terms (type='jargon_term') from document search
+            # This ensures only document chunks are returned, not jargon definitions
+            filtered_results = []
+            for doc, score in results:
+                if doc.metadata.get('type') != 'jargon_term':
+                    filtered_results.append((doc, score))
+
+                # Stop when we have enough results
+                if len(filtered_results) >= self.config_params.vector_search_k:
+                    break
+
+            return filtered_results[:self.config_params.vector_search_k]
+
         except Exception as exc:
             print(f"[HybridRetriever] vector search error: {exc}")
             return []

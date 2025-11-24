@@ -36,10 +36,16 @@ def render_settings_tab(rag_system, env_defaults):
         current_provider = current_values.get("llm_provider", "azure")
         st.session_state.selected_llm_provider = current_provider
 
+    # Ensure selected provider is valid
+    current_provider_value = st.session_state.selected_llm_provider
+    if current_provider_value not in provider_options:
+        current_provider_value = "azure"
+        st.session_state.selected_llm_provider = current_provider_value
+
     selected_provider = st.radio(
         "LLMプロバイダー",
         provider_options,
-        index=provider_options.index(st.session_state.selected_llm_provider),
+        index=provider_options.index(current_provider_value),
         format_func=lambda x: provider_labels[x],
         key="llm_provider_radio_v7",
         horizontal=True,

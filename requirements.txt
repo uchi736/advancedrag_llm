@@ -22,6 +22,7 @@ langchain==0.3.25
 langchain-community==0.3.24
 langchain-core==0.3.62
 langchain-openai==0.3.18
+langchain-huggingface==0.1.2
 langchain-text-splitters==0.3.8
 langsmith==0.3.42
 
@@ -118,3 +119,10 @@ wrapt==1.17.2
 # Optional: Graph visualization (can be removed if not needed)
 pyvis==0.3.2
 plotly==6.1.2
+
+# Hugging Face for local LLM support
+transformers==4.47.1
+torch==2.5.1
+accelerate==1.2.1
+sentence-transformers==3.3.1
+bitsandbytes==0.45.0

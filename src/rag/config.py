@@ -24,6 +24,20 @@ class Config:
     azure_openai_chat_deployment_name: Optional[str] = None
     azure_openai_embedding_deployment_name: Optional[str] = None
 
+    # LLM Provider settings (populated in __post_init__)
+    llm_provider: str = ""  # "azure" or "huggingface"
+
+    # Hugging Face settings (populated in __post_init__)
+    hf_model_id: str = ""
+    hf_embedding_model_id: str = ""
+    hf_device: str = ""  # "cpu", "cuda", "mps"
+    hf_load_in_4bit: bool = False
+    hf_load_in_8bit: bool = False
+    hf_max_new_tokens: int = 0
+    hf_temperature: float = 0.0
+    hf_top_k: int = 0
+    hf_top_p: float = 0.0
+
     # LLM settings (populated in __post_init__)
     llm_temperature: float = 0.0
     max_tokens: int = 0
@@ -60,6 +74,20 @@ class Config:
         self.azure_openai_api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-01")
         self.azure_openai_chat_deployment_name = os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT_NAME")
         self.azure_openai_embedding_deployment_name = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT_NAME")
+
+        # LLM Provider settings
+        self.llm_provider = os.getenv("LLM_PROVIDER", "azure")
+
+        # Hugging Face settings
+        self.hf_model_id = os.getenv("HF_MODEL_ID", "tokyotech-llm/Llama-3.1-Swallow-8B-Instruct-v0.3")
+        self.hf_embedding_model_id = os.getenv("HF_EMBEDDING_MODEL_ID", "intfloat/multilingual-e5-large")
+        self.hf_device = os.getenv("HF_DEVICE", "cuda")
+        self.hf_load_in_4bit = os.getenv("HF_LOAD_IN_4BIT", "true").lower() == "true"
+        self.hf_load_in_8bit = os.getenv("HF_LOAD_IN_8BIT", "false").lower() == "true"
+        self.hf_max_new_tokens = int(os.getenv("HF_MAX_NEW_TOKENS", "2048"))
+        self.hf_temperature = float(os.getenv("HF_TEMPERATURE", "0.0"))
+        self.hf_top_k = int(os.getenv("HF_TOP_K", "50"))
+        self.hf_top_p = float(os.getenv("HF_TOP_P", "0.9"))
 
         # LLM settings
         self.llm_temperature = float(os.getenv("LLM_TEMPERATURE", "0.0"))

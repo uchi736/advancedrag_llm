@@ -74,7 +74,7 @@ def _render_initial_chat_view(rag):
     st.markdown('<div class="initial-input-container">', unsafe_allow_html=True)
 
     st.markdown("<h6>高度なRAG設定:</h6>", unsafe_allow_html=True)
-    opt_cols_initial = st.columns(4)
+    opt_cols_initial = st.columns(5)
     with opt_cols_initial[0]:
         use_qe_initial = st.checkbox("クエリ拡張", value=st.session_state.use_query_expansion, key="use_qe_initial_v7_tab_chat", help="質問を自動的に拡張して検索 (RRFなし)")
     with opt_cols_initial[1]:
@@ -82,6 +82,8 @@ def _render_initial_chat_view(rag):
     with opt_cols_initial[2]:
         use_ja_initial = st.checkbox("専門用語で補強", value=st.session_state.use_jargon_augmentation, key="use_ja_initial_v7_tab_chat", help="専門用語辞書を使って質問を補強")
     with opt_cols_initial[3]:
+        use_rl_initial = st.checkbox("逆引き検索", value=st.session_state.use_reverse_lookup, key="use_rl_initial_v7_tab_chat", help="説明文から専門用語を抽出")
+    with opt_cols_initial[4]:
         use_rr_initial = st.checkbox("LLMリランク", value=st.session_state.use_reranking, key="use_rr_initial_v7_tab_chat", help="LLMで検索結果を並べ替え")
 
     user_input_initial = st.text_area("質問を入力:", placeholder="例：このドキュメントの要約を教えてください / 売上上位10件を表示して", height=100, key="initial_input_textarea_v7_tab_chat", label_visibility="collapsed")
@@ -92,6 +94,7 @@ def _render_initial_chat_view(rag):
             st.session_state.use_query_expansion = use_qe_initial
             st.session_state.use_rag_fusion = use_rf_initial
             st.session_state.use_jargon_augmentation = use_ja_initial
+            st.session_state.use_reverse_lookup = use_rl_initial
             st.session_state.use_reranking = use_rr_initial
             _handle_query(rag, user_input_initial, "initial_input")
             st.rerun()
@@ -116,7 +119,7 @@ def _render_continued_chat_view(rag):
 
         st.markdown("---")
 
-        opt_cols_chat = st.columns(4)
+        opt_cols_chat = st.columns(5)
         with opt_cols_chat[0]:
             use_qe_chat = st.checkbox("クエリ拡張", value=st.session_state.use_query_expansion, key="use_qe_chat_continued_v7_tab_chat", help="クエリ拡張 (RRFなし)")
         with opt_cols_chat[1]:
@@ -124,6 +127,8 @@ def _render_continued_chat_view(rag):
         with opt_cols_chat[2]:
             use_ja_chat = st.checkbox("専門用語で補強", value=st.session_state.use_jargon_augmentation, key="use_ja_chat_continued_v7_tab_chat", help="専門用語辞書を使って質問を補強")
         with opt_cols_chat[3]:
+            use_rl_chat = st.checkbox("逆引き検索", value=st.session_state.use_reverse_lookup, key="use_rl_chat_continued_v7_tab_chat", help="説明文から専門用語を抽出")
+        with opt_cols_chat[4]:
             use_rr_chat = st.checkbox("LLMリランク", value=st.session_state.use_reranking, key="use_rr_chat_continued_v7_tab_chat", help="LLMで検索結果を並べ替え")
 
         user_input_continued = st.text_area(
@@ -139,6 +144,7 @@ def _render_continued_chat_view(rag):
                 st.session_state.use_query_expansion = use_qe_chat
                 st.session_state.use_rag_fusion = use_rf_chat
                 st.session_state.use_jargon_augmentation = use_ja_chat
+                st.session_state.use_reverse_lookup = use_rl_chat
                 st.session_state.use_reranking = use_rr_chat
                 _handle_query(rag, user_input_continued, "continued_chat")
                 st.rerun()
@@ -176,16 +182,18 @@ def _handle_query(rag, user_input, query_source):
                     "use_query_expansion": st.session_state.use_query_expansion,
                     "use_rag_fusion": st.session_state.use_rag_fusion,
                     "use_jargon_augmentation": st.session_state.use_jargon_augmentation,
+                    "use_reverse_lookup": st.session_state.use_reverse_lookup,
                     "use_reranking": st.session_state.use_reranking,
                     "query_source": query_source
                 }
             )
-            
+
             response = rag.query_unified(
                 user_input,
                 use_query_expansion=st.session_state.use_query_expansion,
                 use_rag_fusion=st.session_state.use_rag_fusion,
                 use_jargon_augmentation=st.session_state.use_jargon_augmentation,
+                use_reverse_lookup=st.session_state.use_reverse_lookup,
                 use_reranking=st.session_state.use_reranking,
                 search_type=st.session_state.get('search_type', 'ハイブリッド検索'),
                 config=trace_config
@@ -204,6 +212,7 @@ def _handle_query(rag, user_input, query_source):
             st.session_state.last_golden_retriever = response.get("golden_retriever", {})
             st.session_state.last_reranking = response.get("reranking", {})
             st.session_state.last_jargon_augmentation = response.get("jargon_augmentation", {})
+            st.session_state.last_reverse_lookup = response.get("reverse_lookup", {})
             
             # Temporary: Add mock data if query expansion is enabled
             if st.session_state.use_query_expansion and not st.session_state.last_query_expansion:
@@ -257,7 +266,8 @@ def _render_query_info():
         st.session_state.get("last_query_expansion"),
         st.session_state.get("last_golden_retriever"),
         st.session_state.get("last_reranking"),
-        st.session_state.get("last_jargon_augmentation")
+        st.session_state.get("last_jargon_augmentation"),
+        st.session_state.get("last_reverse_lookup")
     ]):
         with st.expander("🔍 クエリ処理の詳細", expanded=True):
             
@@ -296,7 +306,34 @@ def _render_query_info():
                     if jargon_info.get("augmented_query"):
                         st.markdown("```text\n" + jargon_info['augmented_query'] + "\n```")
                 st.divider()
-            
+
+            # Reverse lookup details
+            if st.session_state.get("last_reverse_lookup"):
+                st.markdown("**🔄 逆引き検索**")
+                reverse_info = st.session_state.last_reverse_lookup
+
+                # 元クエリと拡張後クエリ
+                if reverse_info.get("original_query"):
+                    st.write(f"元クエリ: `{reverse_info['original_query']}`")
+
+                if reverse_info.get("extracted_terms"):
+                    st.write(f"逆引きで特定された専門用語: {', '.join(reverse_info['extracted_terms'])}")
+
+                if reverse_info.get("details"):
+                    st.write("**候補用語と信頼度:**")
+                    for detail in reverse_info["details"]:
+                        term = detail.get("term")
+                        confidence = detail.get("confidence", 0.0)
+                        source = detail.get("source", "unknown")
+                        st.write(f"  • **{term}** (信頼度: {confidence:.2f}, ソース: {source})")
+
+                # 拡張後クエリ
+                if reverse_info.get("augmented_query"):
+                    st.write("**拡張後クエリ:**")
+                    st.markdown("```text\n" + reverse_info['augmented_query'] + "\n```")
+
+                st.divider()
+
             # Query expansion details
             if st.session_state.get("last_query_expansion"):
                 st.markdown("**📈 クエリ拡張**")
@@ -419,7 +456,7 @@ def _render_bulk_query_section(rag_system):
         st.info("質問と想定引用元を記載したCSVファイルをアップロードしてください。\n形式: 質問, 想定の引用元1, 想定の引用元2, 想定の引用元3...")
         
         st.markdown("<h6>高度なRAG設定:</h6>", unsafe_allow_html=True)
-        opt_cols_bulk = st.columns(4)
+        opt_cols_bulk = st.columns(5)
         with opt_cols_bulk[0]:
             use_qe_bulk = st.checkbox("クエリ拡張", value=True, key="use_qe_bulk_v2", help="質問を自動的に拡張して検索 (RRFなし)")
         with opt_cols_bulk[1]:
@@ -427,6 +464,8 @@ def _render_bulk_query_section(rag_system):
         with opt_cols_bulk[2]:
             use_ja_bulk = st.checkbox("専門用語で補強", value=True, key="use_ja_bulk_v2", help="専門用語辞書を使って質問を補強")
         with opt_cols_bulk[3]:
+            use_rl_bulk = st.checkbox("逆引き検索", value=False, key="use_rl_bulk_v2", help="説明文から専門用語を抽出")
+        with opt_cols_bulk[4]:
             use_rr_bulk = st.checkbox("LLMリランク", value=True, key="use_rr_bulk_v2", help="LLMで検索結果を並べ替え")
 
         uploaded_file = st.file_uploader("CSVファイルをアップロード", type="csv", key="bulk_query_uploader")
@@ -471,6 +510,7 @@ def _render_bulk_query_section(rag_system):
                                 use_query_expansion=use_qe_bulk,
                                 use_rag_fusion=use_rf_bulk,
                                 use_jargon_augmentation=use_ja_bulk,
+                                use_reverse_lookup=use_rl_bulk,
                                 use_reranking=use_rr_bulk,
                                 search_type=st.session_state.get('search_type', 'ハイブリッド検索')
                             )

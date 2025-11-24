@@ -26,10 +26,33 @@ def render_settings_tab(rag_system, env_defaults):
         if key == "openai_api_key":
             current_values[key] = None
 
+    # LLM Provider Selection (outside form for real-time switching)
+    st.markdown("### 🤖 LLMプロバイダー選択")
+    provider_options = ["azure", "huggingface"]
+    provider_labels = {"azure": "Azure OpenAI", "huggingface": "Hugging Face (ローカルLLM)"}
+
+    # Initialize session state for provider selection
+    if "selected_llm_provider" not in st.session_state:
+        current_provider = current_values.get("llm_provider", "azure")
+        st.session_state.selected_llm_provider = current_provider
+
+    selected_provider = st.radio(
+        "LLMプロバイダー",
+        provider_options,
+        index=provider_options.index(st.session_state.selected_llm_provider),
+        format_func=lambda x: provider_labels[x],
+        key="llm_provider_radio_v7",
+        horizontal=True,
+        help="Azure OpenAIまたはローカルのHugging Faceモデルを選択"
+    )
+    st.session_state.selected_llm_provider = selected_provider
+    st.markdown("---")
+
     with st.form("detailed_settings_form_v7_tab_settings"):
         col1, col2 = st.columns(2)
         with col1:
             _render_azure_settings(current_values)
+            _render_huggingface_settings(current_values, temp_default_cfg)
             _render_model_identifiers(current_values, temp_default_cfg)
             _render_chunking_settings(current_values, temp_default_cfg)
         with col2:
@@ -59,13 +82,114 @@ def render_settings_tab(rag_system, env_defaults):
     _display_current_config(rag_system)
 
 def _render_azure_settings(values):
+    # Check session state for provider selection
+    if st.session_state.get("selected_llm_provider", "azure") != "azure":
+        return
+
     st.markdown("#### 🔑 Azure OpenAI 設定")
-    st.session_state.form_values = {}
+    if 'form_values' not in st.session_state:
+        st.session_state.form_values = {}
+
+    st.session_state.form_values['llm_provider'] = st.session_state.selected_llm_provider
     st.session_state.form_values['azure_openai_api_key'] = st.text_input("Azure OpenAI APIキー", value=values.get("azure_openai_api_key", ""), type="password", key="setting_azure_key_v7")
     st.session_state.form_values['azure_openai_endpoint'] = st.text_input("Azure OpenAI エンドポイント", value=values.get("azure_openai_endpoint", ""), key="setting_azure_endpoint_v7")
     st.session_state.form_values['azure_openai_api_version'] = st.text_input("Azure OpenAI APIバージョン", value=values.get("azure_openai_api_version", ""), key="setting_azure_version_v7")
     st.session_state.form_values['azure_openai_chat_deployment_name'] = st.text_input("Azure チャットデプロイメント名", value=values.get("azure_openai_chat_deployment_name", ""), key="setting_azure_chat_deploy_v7")
     st.session_state.form_values['azure_openai_embedding_deployment_name'] = st.text_input("Azure 埋め込みデプロイメント名", value=values.get("azure_openai_embedding_deployment_name", ""), key="setting_azure_embed_deploy_v7")
+
+def _render_huggingface_settings(values, defaults):
+    # Check session state for provider selection
+    if st.session_state.get("selected_llm_provider", "azure") != "huggingface":
+        return
+
+    if 'form_values' not in st.session_state:
+        st.session_state.form_values = {}
+
+    st.session_state.form_values['llm_provider'] = st.session_state.selected_llm_provider
+
+    st.markdown("#### 🤗 Hugging Face 設定")
+
+    st.session_state.form_values['hf_model_id'] = st.text_input(
+        "LLMモデルID",
+        value=values.get("hf_model_id", defaults.hf_model_id if hasattr(defaults, "hf_model_id") else "tokyotech-llm/Llama-3.1-Swallow-8B-Instruct-v0.3"),
+        key="setting_hf_model_id_v7",
+        help="Hugging FaceのモデルID（例: tokyotech-llm/Llama-3.1-Swallow-8B-Instruct-v0.3）"
+    )
+
+    st.session_state.form_values['hf_embedding_model_id'] = st.text_input(
+        "埋め込みモデルID",
+        value=values.get("hf_embedding_model_id", defaults.hf_embedding_model_id if hasattr(defaults, "hf_embedding_model_id") else "intfloat/multilingual-e5-large"),
+        key="setting_hf_embedding_model_id_v7",
+        help="埋め込み用モデルID（例: intfloat/multilingual-e5-large）"
+    )
+
+    device_options = ["cuda", "cpu", "mps"]
+    device_labels = {"cuda": "CUDA (NVIDIA GPU)", "cpu": "CPU", "mps": "MPS (Apple Silicon)"}
+    current_device = values.get("hf_device", defaults.hf_device if hasattr(defaults, "hf_device") else "cuda")
+    device_idx = device_options.index(current_device) if current_device in device_options else 0
+
+    st.session_state.form_values['hf_device'] = st.selectbox(
+        "デバイス",
+        device_options,
+        index=device_idx,
+        format_func=lambda x: device_labels[x],
+        key="setting_hf_device_v7",
+        help="推論に使用するデバイス"
+    )
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.session_state.form_values['hf_load_in_4bit'] = st.checkbox(
+            "4-bit量子化",
+            value=values.get("hf_load_in_4bit", defaults.hf_load_in_4bit if hasattr(defaults, "hf_load_in_4bit") else True),
+            key="setting_hf_load_in_4bit_v7",
+            help="メモリ使用量を削減（精度は若干低下）"
+        )
+    with col2:
+        st.session_state.form_values['hf_load_in_8bit'] = st.checkbox(
+            "8-bit量子化",
+            value=values.get("hf_load_in_8bit", defaults.hf_load_in_8bit if hasattr(defaults, "hf_load_in_8bit") else False),
+            key="setting_hf_load_in_8bit_v7",
+            help="4-bitより精度高いが、メモリ使用量は多い"
+        )
+
+    st.session_state.form_values['hf_max_new_tokens'] = st.number_input(
+        "最大トークン数",
+        min_value=128,
+        max_value=8192,
+        value=int(values.get("hf_max_new_tokens", defaults.hf_max_new_tokens if hasattr(defaults, "hf_max_new_tokens") else 2048)),
+        step=128,
+        key="setting_hf_max_new_tokens_v7"
+    )
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.session_state.form_values['hf_temperature'] = st.number_input(
+            "Temperature",
+            min_value=0.0,
+            max_value=2.0,
+            value=float(values.get("hf_temperature", defaults.hf_temperature if hasattr(defaults, "hf_temperature") else 0.0)),
+            step=0.1,
+            key="setting_hf_temperature_v7"
+        )
+    with col2:
+        st.session_state.form_values['hf_top_p'] = st.number_input(
+            "Top P",
+            min_value=0.0,
+            max_value=1.0,
+            value=float(values.get("hf_top_p", defaults.hf_top_p if hasattr(defaults, "hf_top_p") else 0.9)),
+            step=0.05,
+            key="setting_hf_top_p_v7"
+        )
+
+    st.session_state.form_values['hf_top_k'] = st.number_input(
+        "Top K",
+        min_value=1,
+        max_value=200,
+        value=int(values.get("hf_top_k", defaults.hf_top_k if hasattr(defaults, "hf_top_k") else 50)),
+        step=10,
+        key="setting_hf_top_k_v7"
+    )
 
 def _render_model_identifiers(values, defaults):
     st.markdown("#### 🤖 AIモデル識別子 (UI用)")

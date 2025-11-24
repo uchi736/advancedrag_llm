@@ -15,12 +15,16 @@ def initialize_session_state():
         st.session_state.last_golden_retriever = {}
     if "last_reranking" not in st.session_state:
         st.session_state.last_reranking = {}
+    if "last_reverse_lookup" not in st.session_state:
+        st.session_state.last_reverse_lookup = {}
     if "use_query_expansion" not in st.session_state:
         st.session_state.use_query_expansion = False
     if "use_rag_fusion" not in st.session_state:
         st.session_state.use_rag_fusion = False
     if "use_jargon_augmentation" not in st.session_state:
         st.session_state.use_jargon_augmentation = False
+    if "use_reverse_lookup" not in st.session_state:
+        st.session_state.use_reverse_lookup = False
     if "use_reranking" not in st.session_state:
         st.session_state.use_reranking = os.getenv("ENABLE_RERANKING", "false").lower() == "true"
     if "search_type" not in st.session_state:

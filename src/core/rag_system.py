@@ -214,6 +214,14 @@ class RAGSystem:
                 logger = logging.getLogger(__name__)
                 logger.warning(f"Failed to sync jargon terms to vector store: {e}")
 
+        # Initialize reverse lookup engine
+        from src.rag.reverse_lookup import ReverseLookupEngine
+        self.reverse_lookup_engine = ReverseLookupEngine(
+            jargon_manager=self.jargon_manager,
+            vector_store=self.vector_store,
+            llm=self.llm
+        )
+
         self.ingestion_handler = IngestionHandler(
             cfg,
             self.vector_store,
@@ -229,10 +237,21 @@ class RAGSystem:
         self.evaluator = None  # Lazy initialization to avoid overhead when not needed
 
     def _init_llms_and_embeddings(self):
-        """Initialize LLM and embedding models with Azure OpenAI."""
+        """Initialize LLM and embedding models based on configured provider."""
         import logging
         logger = logging.getLogger(__name__)
-        logger.info("RAGSystem initialized with Azure OpenAI.")
+
+        provider = getattr(self.config, 'llm_provider', 'azure').lower()
+
+        if provider == "huggingface":
+            logger.info("RAGSystem initialized with Hugging Face local models.")
+            self._init_huggingface_models()
+        else:
+            logger.info("RAGSystem initialized with Azure OpenAI.")
+            self._init_azure_openai_models()
+
+    def _init_azure_openai_models(self):
+        """Initialize Azure OpenAI models."""
         self.llm = AzureChatOpenAI(
             temperature=getattr(self.config, 'llm_temperature', 0.0),
             max_tokens=getattr(self.config, 'max_tokens', 4096),
@@ -247,6 +266,81 @@ class RAGSystem:
             azure_endpoint=self.config.azure_openai_endpoint,
             api_version=self.config.azure_openai_api_version
         )
+
+    def _init_huggingface_models(self):
+        """Initialize Hugging Face local models."""
+        from langchain_huggingface import HuggingFacePipeline, ChatHuggingFace, HuggingFaceEmbeddings
+        import logging
+        logger = logging.getLogger(__name__)
+
+        # Determine device
+        device_map = None
+        device = -1  # CPU default
+        if self.config.hf_device == "cuda":
+            import torch
+            if torch.cuda.is_available():
+                device = 0
+                device_map = "auto"
+                logger.info("Using CUDA for inference")
+            else:
+                logger.warning("CUDA requested but not available, falling back to CPU")
+        elif self.config.hf_device == "mps":
+            import torch
+            if torch.backends.mps.is_available():
+                device_map = "mps"
+                logger.info("Using MPS (Apple Silicon) for inference")
+            else:
+                logger.warning("MPS requested but not available, falling back to CPU")
+
+        # Prepare model kwargs
+        model_kwargs = {}
+        if self.config.hf_load_in_4bit:
+            model_kwargs["load_in_4bit"] = True
+            logger.info("Loading model in 4-bit quantization")
+        elif self.config.hf_load_in_8bit:
+            model_kwargs["load_in_8bit"] = True
+            logger.info("Loading model in 8-bit quantization")
+
+        if device_map:
+            model_kwargs["device_map"] = device_map
+
+        # Initialize LLM pipeline
+        try:
+            pipeline_kwargs = {
+                "max_new_tokens": self.config.hf_max_new_tokens,
+                "temperature": self.config.hf_temperature,
+                "top_k": self.config.hf_top_k,
+                "top_p": self.config.hf_top_p,
+                "do_sample": self.config.hf_temperature > 0,
+            }
+
+            llm_pipeline = HuggingFacePipeline.from_model_id(
+                model_id=self.config.hf_model_id,
+                task="text-generation",
+                device=device if device != -1 else None,
+                pipeline_kwargs=pipeline_kwargs,
+                model_kwargs=model_kwargs
+            )
+
+            # Wrap with ChatHuggingFace for chat template support
+            self.llm = ChatHuggingFace(llm=llm_pipeline)
+            logger.info(f"Loaded LLM: {self.config.hf_model_id}")
+        except Exception as e:
+            logger.error(f"Failed to load Hugging Face LLM: {e}")
+            raise
+
+        # Initialize embeddings
+        try:
+            embed_device = "cuda" if device == 0 else "cpu"
+            self.embeddings = HuggingFaceEmbeddings(
+                model_name=self.config.hf_embedding_model_id,
+                model_kwargs={"device": embed_device},
+                encode_kwargs={"normalize_embeddings": True}
+            )
+            logger.info(f"Loaded embeddings: {self.config.hf_embedding_model_id}")
+        except Exception as e:
+            logger.error(f"Failed to load Hugging Face embeddings: {e}")
+            raise
 
     def _init_db(self):
         """Initialize database tables and extensions."""
@@ -727,6 +821,7 @@ class RAGSystem:
         use_query_expansion: bool = False,
         use_rag_fusion: bool = False,
         use_jargon_augmentation: bool = False,
+        use_reverse_lookup: bool = False,
         use_reranking: bool = False,
         search_type: str = None,  # None uses config.default_search_type
         config: Any = None
@@ -738,6 +833,7 @@ class RAGSystem:
             use_query_expansion: Enable query expansion
             use_rag_fusion: Enable RAG fusion (query expansion + RRF)
             use_jargon_augmentation: Enable jargon augmentation
+            use_reverse_lookup: Enable reverse lookup (description → technical term)
             use_reranking: Enable LLM reranking
             search_type: Search type ("ハイブリッド検索", "ベクトル検索", "キーワード検索")
             config: Optional RunnableConfig for tracing
@@ -762,9 +858,85 @@ class RAGSystem:
         search_type_eng = search_type_map.get(search_type, search_type)  # Pass through if already English
 
         with get_openai_callback() as cb:
+            # Apply reverse lookup if enabled
+            augmented_question = question
+            reverse_lookup_info = {}
+
+            if use_reverse_lookup:
+                try:
+                    # Create config for reverse lookup tracing
+                    reverse_lookup_config = None
+                    if config:
+                        reverse_lookup_config = RunnableConfig(
+                            run_name="Reverse Lookup",
+                            tags=config.get("tags", []) + ["reverse_lookup"],
+                            metadata={
+                                **config.get("metadata", {}),
+                                "original_query": question
+                            }
+                        )
+
+                    reverse_results = self.reverse_lookup_engine.reverse_lookup(
+                        question,
+                        top_k=5,
+                        config=reverse_lookup_config
+                    )
+                    if reverse_results:
+                        # Extract technical terms from reverse lookup
+                        extracted_terms = [r.term for r in reverse_results]
+                        terms_str = ', '.join(extracted_terms[:3])  # Top 3 terms for display
+
+                        # Use LLM to create natural query expansion
+                        from src.rag.prompts import get_reverse_lookup_query_expansion_prompt
+                        from langchain_core.output_parsers import StrOutputParser
+
+                        expansion_prompt = get_reverse_lookup_query_expansion_prompt()
+                        expansion_chain = expansion_prompt | self.llm | StrOutputParser()
+
+                        try:
+                            # Create LLM-expanded query
+                            augmented_question = expansion_chain.invoke({
+                                "original_query": question,
+                                "identified_terms": terms_str
+                            }, config=reverse_lookup_config)
+
+                            # Clean up LLM output (remove common prefixes that LLM might include)
+                            augmented_question = augmented_question.strip()
+
+                            # Remove common prefixes
+                            prefixes_to_remove = [
+                                "改良後の検索クエリ:", "改良後のクエリ:", "検索クエリ:",
+                                "クエリ:", "改良後の質問:", "質問:", "回答:"
+                            ]
+                            for prefix in prefixes_to_remove:
+                                if augmented_question.startswith(prefix):
+                                    augmented_question = augmented_question[len(prefix):].strip()
+                                    logger.info(f"Removed prefix '{prefix}' from LLM output")
+                                    break
+
+                            # Fallback: If LLM expansion is too short or failed, use simple concatenation
+                            if not augmented_question or len(augmented_question.strip()) < 10:
+                                logger.warning("LLM expansion returned short result, using fallback")
+                                augmented_question = f"{question} {' '.join(extracted_terms[:3])}"
+
+                        except Exception as llm_exp_error:
+                            logger.warning(f"LLM query expansion failed, using simple concatenation: {llm_exp_error}")
+                            augmented_question = f"{question} {' '.join(extracted_terms[:3])}"
+
+                        reverse_lookup_info = {
+                            "original_query": question,
+                            "augmented_query": augmented_question,
+                            "extracted_terms": extracted_terms,
+                            "details": [{"term": r.term, "confidence": r.confidence, "source": r.source} for r in reverse_results]
+                        }
+                except Exception as e:
+                    import logging
+                    logger = logging.getLogger(__name__)
+                    logger.warning(f"Reverse lookup failed: {e}")
+
             # Prepare input for retrieval chain
             retrieval_input = {
-                "question": question,
+                "question": augmented_question,
                 "use_query_expansion": use_query_expansion,
                 "use_rag_fusion": use_rag_fusion,
                 "use_jargon_augmentation": use_jargon_augmentation,
@@ -825,10 +997,11 @@ class RAGSystem:
                 "sources": sources,
                 "context": documents,
                 "total_tokens": cb.total_tokens if hasattr(cb, "total_tokens") else 0,
-                "retrieval_query": retrieval_result.get("retrieval_query", question),
+                "retrieval_query": retrieval_result.get("retrieval_query", augmented_question),
                 "query_expansion": retrieval_result.get("query_expansion", {}),
                 "golden_retriever": retrieval_result.get("golden_retriever", {}),
                 "jargon_augmentation": retrieval_result.get("jargon_augmentation", {}),
+                "reverse_lookup": reverse_lookup_info,
                 "reranking": retrieval_result.get("reranking", {})
             }
 

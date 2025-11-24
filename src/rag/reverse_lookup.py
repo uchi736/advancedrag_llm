@@ -148,7 +148,7 @@ class ReverseLookupEngine:
         """
         return 1.0 / (k + rank)
 
-    def reverse_lookup(self, query: str, top_k: int = 5) -> List[ReverseLookupResult]:
+    def reverse_lookup(self, query: str, top_k: int = 5, config=None) -> List[ReverseLookupResult]:
         """
         Perform hybrid reverse lookup to find technical terms from descriptions.
 
@@ -160,6 +160,7 @@ class ReverseLookupEngine:
         Args:
             query: Description or explanation to lookup
             top_k: Maximum number of results to return
+            config: Optional RunnableConfig for LangSmith tracing
 
         Returns:
             List of ReverseLookupResult objects sorted by confidence
@@ -176,9 +177,9 @@ class ReverseLookupEngine:
             ReverseLookupResult(
                 term=term,
                 confidence=score,
-                source='hybrid'
+                source=source
             )
-            for term, score in fused_results[:15]  # Top 15 candidates
+            for term, score, source in fused_results[:15]  # Top 15 candidates
         ]
 
         if not candidates:
@@ -196,7 +197,7 @@ class ReverseLookupEngine:
         # Case 2: Multiple high or medium confidence results -> use LLM reranking
         if len(high_confidence) >= 3 or len(medium_confidence) >= 3:
             logger.info(f"Reverse lookup: using LLM reranking for {len(candidates[:10])} candidates")
-            return self._llm_rerank(query, candidates[:10], top_k)
+            return self._llm_rerank(query, candidates[:10], top_k, config=config)
 
         # Case 3: Low confidence or few results -> return as is
         return candidates[:top_k]
@@ -309,7 +310,7 @@ class ReverseLookupEngine:
         keyword_results: List[Tuple[str, float]],
         vector_results: List[Tuple[str, float]],
         k: int = 60
-    ) -> List[Tuple[str, float]]:
+    ) -> List[Tuple[str, float, str]]:
         """
         Fuse keyword and vector search results using RRF.
 
@@ -319,25 +320,45 @@ class ReverseLookupEngine:
             k: RRF constant (default: 60)
 
         Returns:
-            Fused results [(term, rrf_score), ...]
+            Fused results [(term, rrf_score, source), ...]
+            source can be: 'keyword', 'vector', or 'hybrid'
         """
         rrf_scores = {}
+        term_sources = {}  # Track which search methods found each term
 
         # Add RRF scores from keyword results
         for rank, (term, score) in enumerate(keyword_results, start=1):
             rrf_scores[term] = rrf_scores.get(term, 0.0) + self._rrf_score(rank, k)
+            if term not in term_sources:
+                term_sources[term] = set()
+            term_sources[term].add('keyword')
 
         # Add RRF scores from vector results
         for rank, (term, score) in enumerate(vector_results, start=1):
             rrf_scores[term] = rrf_scores.get(term, 0.0) + self._rrf_score(rank, k)
+            if term not in term_sources:
+                term_sources[term] = set()
+            term_sources[term].add('vector')
 
         # Normalize to 0-1 range
         if rrf_scores:
             max_score = max(rrf_scores.values())
             rrf_scores = {term: score / max_score for term, score in rrf_scores.items()}
 
+        # Determine source label for each term
+        results_with_source = []
+        for term, score in rrf_scores.items():
+            sources = term_sources.get(term, set())
+            if len(sources) == 2:
+                source_label = 'hybrid'
+            elif 'keyword' in sources:
+                source_label = 'keyword'
+            else:
+                source_label = 'vector'
+            results_with_source.append((term, score, source_label))
+
         # Sort by score
-        ranked = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
+        ranked = sorted(results_with_source, key=lambda x: x[1], reverse=True)
 
         return ranked
 
@@ -345,7 +366,8 @@ class ReverseLookupEngine:
         self,
         query: str,
         candidates: List[ReverseLookupResult],
-        top_k: int = 5
+        top_k: int = 5,
+        config=None
     ) -> List[ReverseLookupResult]:
         """
         Rerank candidates using LLM for final selection.
@@ -354,6 +376,7 @@ class ReverseLookupEngine:
             query: Original query
             candidates: Candidate results (typically 10 or fewer)
             top_k: Number of results to return
+            config: Optional RunnableConfig for LangSmith tracing
 
         Returns:
             Reranked results
@@ -380,7 +403,7 @@ class ReverseLookupEngine:
 回答:"""
 
         try:
-            response = self.llm.invoke(prompt)
+            response = self.llm.invoke(prompt, config=config)
             selected_indices = self._parse_llm_ranking(response.content)
 
             # Extract selected terms

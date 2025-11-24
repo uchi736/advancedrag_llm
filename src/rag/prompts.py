@@ -101,6 +101,25 @@ ANSWER_GENERATION = """以下のコンテキスト情報を基に、質問に対
 
 回答:"""
 
+REVERSE_LOOKUP_QUERY_EXPANSION = """あなたは検索クエリ最適化の専門家です。
+ユーザーの質問と、逆引き検索で特定された専門用語リストを使って、より正確で自然な検索クエリに再構築してください。
+
+【改良方針】
+1. 元の質問の意図を保持
+2. 専門用語を自然に組み込む（単純な羅列ではなく文章として統合）
+3. 簡潔で明確（80-120文字程度）
+4. 検索エンジンが関連文書を見つけやすい表現
+
+【入力情報】
+元の質問: {original_query}
+
+逆引きで特定された専門用語: {identified_terms}
+
+【出力形式】
+改良後の検索クエリのみを1行で出力してください。
+「改良後の検索クエリ:」「クエリ:」などのラベルや前置きは一切含めないでください。
+"""
+
 # Convenience functions to get ChatPromptTemplate objects
 def get_jargon_extraction_prompt(max_terms=5):
     template = JARGON_EXTRACTION.replace("{{max_terms}}", str(max_terms))
@@ -117,6 +136,9 @@ def get_reranking_prompt():
 
 def get_answer_generation_prompt():
     return ChatPromptTemplate.from_template(ANSWER_GENERATION)
+
+def get_reverse_lookup_query_expansion_prompt():
+    return ChatPromptTemplate.from_template(REVERSE_LOOKUP_QUERY_EXPANSION)
 
 # Term extraction prompts
 DEFINITION_GENERATION_SYSTEM_PROMPT = """あなたは専門用語の定義作成の専門家です。

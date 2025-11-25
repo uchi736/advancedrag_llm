@@ -301,7 +301,8 @@ def _apply_settings(form_values):
             if "rag_system" in st.session_state:
                 del st.session_state["rag_system"]
             st.cache_resource.clear()
-            st.session_state.rag_system = initialize_rag_system(new_config)
+            collection_name = new_config.collection_name
+            st.session_state.rag_system = initialize_rag_system(collection_name, new_config)
         st.success("✅ 設定が正常に適用され、システムが初期化されました！")
         time.sleep(1)
         st.rerun()
@@ -322,7 +323,8 @@ def _reset_to_defaults(env_defaults):
         if "rag_system" in st.session_state:
             del st.session_state["rag_system"]
         st.cache_resource.clear()
-        st.session_state.rag_system = initialize_rag_system(default_config)
+        collection_name = default_config.collection_name
+        st.session_state.rag_system = initialize_rag_system(collection_name, default_config)
     st.success("✅ 設定がデフォルトにリセットされ、システムが初期化されました！")
     time.sleep(1)
     st.rerun()

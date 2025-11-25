@@ -59,7 +59,6 @@ def render_settings_tab(rag_system, env_defaults):
         with col1:
             _render_azure_settings(current_values)
             _render_huggingface_settings(current_values, temp_default_cfg)
-            _render_model_identifiers(current_values, temp_default_cfg)
             _render_chunking_settings(current_values, temp_default_cfg)
         with col2:
             _render_search_rag_settings(current_values, temp_default_cfg)
@@ -196,18 +195,6 @@ def _render_huggingface_settings(values, defaults):
         step=10,
         key="setting_hf_top_k_v7"
     )
-
-def _render_model_identifiers(values, defaults):
-    st.markdown("#### 🤖 AIモデル識別子 (UI用)")
-    emb_opts = ["text-embedding-ada-002", "text-embedding-3-small", "text-embedding-3-large"]
-    current_emb = values.get("embedding_model_identifier", defaults.embedding_model_identifier)
-    emb_idx = emb_opts.index(current_emb) if current_emb in emb_opts else 0
-    st.session_state.form_values['embedding_model_identifier'] = st.selectbox("埋め込みモデル識別子", emb_opts, index=emb_idx, key="setting_emb_model_id_v7")
-
-    llm_opts = ["gpt-4.1-mini", "gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-4", "gpt-3.5-turbo", "gpt-3.5-turbo-16k"]
-    current_llm = values.get("llm_model_identifier", defaults.llm_model_identifier)
-    llm_idx = llm_opts.index(current_llm) if current_llm in llm_opts else 0
-    st.session_state.form_values['llm_model_identifier'] = st.selectbox("言語モデル識別子", llm_opts, index=llm_idx, key="setting_llm_model_id_v7")
 
 def _render_chunking_settings(values, defaults):
     st.markdown("#### 📄 チャンク設定")

@@ -72,8 +72,6 @@ def get_rag_system():
                     azure_openai_chat_deployment_name=azure_chat_deployment,
                     azure_openai_embedding_deployment_name=azure_embedding_deployment,
                     db_password=os.getenv("DB_PASSWORD", "postgres"),
-                    llm_model_identifier=os.getenv("LLM_MODEL_IDENTIFIER", "gpt-4.1-mini"),
-                    embedding_model_identifier=os.getenv("EMBEDDING_MODEL_IDENTIFIER", "text-embedding-ada-002"),
                     collection_name=collection_name,
                     final_k=int(os.getenv("FINAL_K", 5)),
                     enable_jargon_augmentation=st.session_state.use_jargon_augmentation

@@ -14,8 +14,6 @@ class Config:
 
     # OpenAI settings (populated in __post_init__)
     openai_api_key: Optional[str] = None
-    embedding_model_identifier: str = ""
-    llm_model_identifier: str = ""
 
     # Azure OpenAI settings (populated in __post_init__)
     azure_openai_api_key: Optional[str] = None
@@ -65,8 +63,6 @@ class Config:
 
         # OpenAI settings
         self.openai_api_key = os.getenv("OPENAI_API_KEY")
-        self.embedding_model_identifier = os.getenv("EMBEDDING_MODEL_IDENTIFIER", "text-embedding-3-small")
-        self.llm_model_identifier = os.getenv("LLM_MODEL_IDENTIFIER", "gpt-4o-mini")
 
         # Azure OpenAI settings
         self.azure_openai_api_key = os.getenv("AZURE_OPENAI_API_KEY")

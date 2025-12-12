@@ -367,3 +367,125 @@ def get_synonym_detection_prompt():
         ("system", SYNONYM_DETECTION_SYSTEM_PROMPT),
         ("user", SYNONYM_DETECTION_USER_PROMPT)
     ])
+
+# ========== Stage 2.5: Self-Reflection & Refinement ==========
+
+SELF_REFLECTION_SYSTEM_PROMPT = """あなたは専門用語抽出の品質管理エキスパートです。
+現在抽出された専門用語リストを厳密に分析し、問題点を発見してください。
+
+分析観点:
+
+1. **誤検出（False Positives）**:
+   - 一般的すぎる語が残っていないか？（例: 「処理」「実施」「結果」など）
+   - 専門用語に見えて実は一般語では？
+
+2. **定義の妥当性**:
+   - brief_definition が用語の専門性を裏付けているか？
+   - 定義が曖昧・汎用的すぎないか？
+   - 「～を行う」「～すること」など汎用的な説明になっていないか？
+
+3. **一貫性**:
+   - 同じ専門性レベルの用語が選ばれているか？
+   - ドメイン（分野）がバラバラでないか？
+   - 明らかに専門性が低い用語が混入していないか？
+
+4. **見落とし（参考）**:
+   - 候補リストに本来専門用語だった語が残っていないか？（参考情報として）
+
+5. **全体的な品質**:
+   - このリストを外部に提供できる品質か？
+   - 信頼度スコアは？（0.0-1.0）
+
+出力形式:
+{{
+  "issues_found": ["問題点1", "問題点2", ...],
+  "new_issues": ["前回になかった新規問題1", ...],
+  "resolved_issues": ["前回から解消された問題1", ...],
+  "confidence_in_current_list": 0.0～1.0,
+  "suggested_actions": ["具体的な改善アクション1", "アクション2", ...],
+  "should_continue": true/false,
+  "reasoning": "判断の理由を詳しく説明"
+}}
+
+## 収束判定の厳格化
+
+以下の条件を**いずれか満たす場合は should_continue=false**:
+1. 前回の指摘（reflection_history）と今回の issues_found が80%以上重複している
+2. confidence_in_current_list >= 0.85
+3. new_issues が0件かつ resolved_issues が0件（改善が停滞）
+
+注意:
+- 問題がなく品質が高ければ confidence: 0.9以上、should_continue: false を返す
+- 深刻な問題があれば具体的な改善アクションを提案
+- suggested_actions は具体的に（例: "「処理」「実施」などの汎用動詞を除外"）
+- 前回の反省履歴も考慮して、改善が進んでいるか評価
+- 前回と同じ問題を繰り返し指摘する場合は収束と判断する"""
+
+SELF_REFLECTION_USER_PROMPT = """現在の専門用語リスト（{num_terms}個）:
+{terms_json}
+
+候補リスト（参考）（{num_candidates}個の候補から選別済み）:
+{candidates_sample}
+
+前回の反省（前回何を改善したか）:
+{previous_reflection}
+
+---
+
+上記を分析し、JSON形式で評価してください。"""
+
+TERM_REFINEMENT_SYSTEM_PROMPT = """前回の反省で指摘された問題点に基づき、各専門用語について適切なアクションを決定してください。
+
+アクションの種類:
+1. **remove**: 一般語として除外する（理由を明記）
+2. **keep**: 専門用語として保持する（必要なら新しいスコアを付与）
+3. **investigate**: RAG検索でさらにコンテキストを調査する必要がある
+
+判定基準:
+- 汎用的すぎる動詞・名詞 → remove
+- 定義が曖昧で専門性が不明 → investigate
+- 明確に専門的な用語 → keep
+
+出力形式（JSON配列）:
+[
+  {{"action": "remove", "term": "処理", "reason": "汎用的すぎる動詞で、定義も一般的"}},
+  {{"action": "keep", "term": "機械学習", "reason": "明確な専門用語", "new_score": 0.95}},
+  {{"action": "investigate", "term": "学習", "reason": "文脈次第で専門用語の可能性"}},
+  ...
+]
+
+注意:
+- すべての用語について判定してください
+- 理由は具体的に（brief_definitionの内容を参照）
+- 除外する場合は必ず納得できる理由を記述"""
+
+TERM_REFINEMENT_USER_PROMPT = """前回の反省で以下の問題が指摘されました:
+
+問題点:
+{issues}
+
+推奨アクション:
+{actions}
+
+---
+
+現在の専門用語リスト:
+{terms_json}
+
+---
+
+各用語について適切なアクションを決定し、JSON配列で返してください。"""
+
+def get_self_reflection_prompt():
+    """Stage 2.5a: 自己反省プロンプト"""
+    return ChatPromptTemplate.from_messages([
+        ("system", SELF_REFLECTION_SYSTEM_PROMPT),
+        ("user", SELF_REFLECTION_USER_PROMPT)
+    ])
+
+def get_term_refinement_prompt():
+    """Stage 2.5b: 用語改善プロンプト"""
+    return ChatPromptTemplate.from_messages([
+        ("system", TERM_REFINEMENT_SYSTEM_PROMPT),
+        ("user", TERM_REFINEMENT_USER_PROMPT)
+    ])

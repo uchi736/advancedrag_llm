@@ -3,14 +3,22 @@ term_extraction.py
 ==================
 LLMベースのシンプルな専門用語抽出モジュール
 統計的手法を使用せず、LLMに直接テキストを渡して専門用語を抽出
+
+LangGraphによるワークフロー型抽出:
+- Stage 1: 候補抽出
+- Stage 2: 初期選別
+- Stage 2.5: 自己反省ループ（再帰的精緻化）
+- Stage 3: 定義生成
+- Stage 4: 類義語検出
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import operator
 from pathlib import Path
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Annotated, Literal
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from langchain_openai import ChatOpenAI, AzureChatOpenAI
@@ -20,6 +28,10 @@ from langchain_core.documents import Document
 from pydantic import BaseModel, Field
 import asyncio
 from tqdm import tqdm
+
+# LangGraph imports
+from langgraph.graph import StateGraph, END
+from typing import TypedDict
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +56,43 @@ class FilteredTermResult(BaseModel):
     """Stage 2の選別結果（選ばれた用語と除外された用語）"""
     selected: List[ExtractedTerm] = Field(description="専門用語として選ばれた用語")
     rejected: List[ExtractedTerm] = Field(description="除外された用語（rejection_reason付き）")
+
+
+class ReflectionResult(BaseModel):
+    """Stage 2.5: 自己反省の結果"""
+    issues_found: List[str] = Field(description="発見された問題点")
+    confidence_in_current_list: float = Field(description="現在のリストへの信頼度 (0-1)")
+    suggested_actions: List[str] = Field(description="推奨される改善アクション")
+    should_continue: bool = Field(description="反復を続けるべきか")
+    reasoning: str = Field(description="判断の理由")
+
+
+# ========== LangGraph State ==========
+
+def _overwrite_list(existing, new):
+    """リデューサー: 新しいリストで上書き（operator.addの代替）"""
+    return new
+
+
+class TermExtractionState(TypedDict):
+    """LangGraph用の状態定義"""
+    # 入力
+    text_chunks: List[str]
+
+    # 抽出結果
+    candidates: List[Dict]  # Stage 1の候補リスト
+    technical_terms: List[Dict]  # 現在の専門用語リスト
+    rejected_terms: Annotated[List[Dict], _overwrite_list]  # 除外された用語（上書き）
+
+    # Stage 2.5 ループ用
+    refinement_iteration: int  # 現在の反復回数
+    max_refinement_iterations: int  # 最大反復回数
+    refinement_converged: bool  # 収束フラグ
+    reflection_history: Annotated[List[Dict], _overwrite_list]  # 反省履歴（上書き）
+    previous_list_hash: Optional[int]  # 前回のリストハッシュ（変更検知用）
+
+    # 出力ディレクトリ
+    output_dir: Optional[Path]
 
 
 # ========== JargonDictionaryManager (互換性のため残す) ==========
@@ -447,7 +496,17 @@ class TermExtractor:
             return ""
 
     async def _extract_terms(self, text: str, output_dir: Optional[Path] = None) -> List[Dict[str, Any]]:
-        """テキストから専門用語を抽出（2段階処理）"""
+        """テキストから専門用語を抽出（LangGraph版を使用）"""
+        # 設定で新実装が有効な場合はLangGraph版を使用
+        use_langgraph = getattr(self.config, 'use_langgraph_extraction', True)
+
+        if use_langgraph:
+            return await self._extract_terms_with_langgraph(text, output_dir)
+        else:
+            return await self._extract_terms_legacy(text, output_dir)
+
+    async def _extract_terms_legacy(self, text: str, output_dir: Optional[Path] = None) -> List[Dict[str, Any]]:
+        """テキストから専門用語を抽出（従来の2段階処理）"""
         import asyncio
         from tqdm import tqdm
 
@@ -1147,6 +1206,405 @@ class TermExtractor:
 
         logger.info(f"Saved {saved_count} terms to database")
         return saved_count
+
+    # ========== LangGraph Workflow Nodes ==========
+
+    async def _build_workflow(self) -> StateGraph:
+        """LangGraphワークフローを構築"""
+        from .prompts import get_self_reflection_prompt, get_term_refinement_prompt
+
+        # ワークフロー定義
+        workflow = StateGraph(TermExtractionState)
+
+        # ノード追加
+        workflow.add_node("stage1_extract_candidates", self._node_stage1_extract_candidates)
+        workflow.add_node("stage2_initial_filter", self._node_stage2_initial_filter)
+        workflow.add_node("stage25_self_reflection", self._node_stage25_self_reflection)
+        workflow.add_node("stage25_refine_terms", self._node_stage25_refine_terms)
+        workflow.add_node("stage3_generate_definitions", self._node_stage3_generate_definitions)
+        workflow.add_node("stage4_detect_synonyms", self._node_stage4_detect_synonyms)
+
+        # エッジ定義
+        workflow.set_entry_point("stage1_extract_candidates")
+        workflow.add_edge("stage1_extract_candidates", "stage2_initial_filter")
+        workflow.add_edge("stage2_initial_filter", "stage25_self_reflection")
+        workflow.add_edge("stage25_self_reflection", "stage25_refine_terms")
+
+        # Stage 2.5 ループの条件分岐
+        workflow.add_conditional_edges(
+            "stage25_refine_terms",
+            self._should_continue_refinement,
+            {
+                "continue": "stage25_self_reflection",  # ループバック
+                "finish": "stage3_generate_definitions"  # 次のステージへ
+            }
+        )
+
+        # 固定フロー
+        workflow.add_edge("stage3_generate_definitions", "stage4_detect_synonyms")
+        workflow.add_edge("stage4_detect_synonyms", END)
+
+        return workflow.compile()
+
+    async def _node_stage1_extract_candidates(self, state: TermExtractionState) -> TermExtractionState:
+        """Stage 1: 候補抽出ノード"""
+        logger.info("[Stage 1] Extracting candidates...")
+        print(f"\n[Stage 1] チャンクから候補抽出中 ({len(state['text_chunks'])}個のチャンク)...")
+
+        all_candidates = []
+        chain = self.candidate_extraction_prompt | self.llm | self.json_parser
+
+        # 並列処理
+        tasks = []
+        for i, chunk in enumerate(state["text_chunks"]):
+            task = chain.ainvoke({
+                "text": chunk,
+                "format_instructions": self.json_parser.get_format_instructions()
+            })
+            tasks.append(task)
+
+        # プログレスバー付き実行
+        results = []
+        with tqdm(total=len(tasks), desc="候補抽出", unit="chunk", ncols=80) as pbar:
+            for coro in asyncio.as_completed(tasks):
+                result = await coro
+                results.append(result)
+                pbar.update(1)
+
+        # 結果を集約
+        for result in results:
+            if hasattr(result, "terms"):
+                candidates = result.terms
+            elif isinstance(result, dict):
+                candidates = result.get("terms", [])
+            else:
+                continue
+
+            for candidate in candidates:
+                if hasattr(candidate, "dict"):
+                    cand_dict = candidate.dict()
+                elif isinstance(candidate, dict):
+                    cand_dict = candidate
+                else:
+                    continue
+
+                if "term" in cand_dict:
+                    cand_dict["headword"] = cand_dict.pop("term")
+
+                all_candidates.append(cand_dict)
+
+        # 重複除去
+        state["candidates"] = self._merge_duplicates(all_candidates)
+        logger.info(f"Stage 1 complete: {len(state['candidates'])} candidates")
+        print(f"✓ {len(state['candidates'])}個の候補を抽出しました\n")
+
+        # Stage 1結果を保存
+        if state.get("output_dir"):
+            stage1_file = state["output_dir"] / "stage1_candidates.json"
+            state["output_dir"].mkdir(parents=True, exist_ok=True)
+            with open(stage1_file, "w", encoding="utf-8") as f:
+                json.dump({"candidates": state["candidates"]}, f, ensure_ascii=False, indent=2)
+            print(f"✓ Stage 1 結果を保存: {stage1_file}\n")
+
+        return state
+
+    async def _node_stage2_initial_filter(self, state: TermExtractionState) -> TermExtractionState:
+        """Stage 2: 初期選別ノード"""
+        logger.info("[Stage 2] Initial filtering...")
+        print(f"[Stage 2] 専門用語を選別中...")
+
+        # バッチ処理で選別
+        technical_terms = await self._filter_technical_terms(state["candidates"], output_dir=state.get("output_dir"))
+
+        state["technical_terms"] = technical_terms
+        state["refinement_iteration"] = 0
+        state["refinement_converged"] = False
+        state["previous_list_hash"] = None
+
+        logger.info(f"Stage 2 complete: {len(technical_terms)} technical terms")
+        print(f"✓ {len(technical_terms)}個の専門用語を選別しました\n")
+
+        return state
+
+    async def _node_stage25_self_reflection(self, state: TermExtractionState) -> TermExtractionState:
+        """Stage 2.5a: 自己反省ノード"""
+        from .prompts import get_self_reflection_prompt
+        import random
+
+        logger.info(f"[Stage 2.5] Self-reflection (iteration {state['refinement_iteration']})...")
+        print(f"[Stage 2.5] 自己反省中 (反復 {state['refinement_iteration'] + 1}/{state['max_refinement_iterations']})...")
+
+        # 用語リストをランダムサンプリング（毎回異なる視点で評価）
+        sample_size_terms = min(50, len(state["technical_terms"]))
+        sample_terms = random.sample(state["technical_terms"], sample_size_terms) if sample_size_terms > 0 else []
+        terms_json = json.dumps(
+            sample_terms,
+            ensure_ascii=False,
+            indent=2
+        )
+
+        # 候補のランダムサンプル
+        sample_size_candidates = min(20, len(state["candidates"]))
+        sample_candidates = random.sample(state["candidates"], sample_size_candidates) if sample_size_candidates > 0 else []
+        candidates_sample = json.dumps(
+            sample_candidates,
+            ensure_ascii=False,
+            indent=2
+        )
+
+        # 前回の反省
+        previous_reflection = "初回の反省"
+        if state["reflection_history"]:
+            prev = state["reflection_history"][-1]
+            previous_reflection = f"前回の問題点: {', '.join(prev.get('issues_found', []))}\n前回のアクション: {', '.join(prev.get('suggested_actions', []))}"
+
+        # LLM実行
+        prompt = get_self_reflection_prompt()
+        chain = prompt | self.llm
+
+        result = await chain.ainvoke({
+            "num_terms": len(state["technical_terms"]),
+            "terms_json": terms_json,
+            "num_candidates": len(state["candidates"]),
+            "candidates_sample": candidates_sample,
+            "previous_reflection": previous_reflection
+        })
+
+        # JSONパース
+        import re
+        content = result.content if hasattr(result, 'content') else str(result)
+        json_match = re.search(r'\{.*\}', content, re.DOTALL)
+
+        if json_match:
+            try:
+                reflection = json.loads(json_match.group(0))
+            except json.JSONDecodeError:
+                reflection = {
+                    "issues_found": [],
+                    "confidence_in_current_list": 0.5,
+                    "suggested_actions": [],
+                    "should_continue": True,
+                    "reasoning": "Parse failed"
+                }
+        else:
+            reflection = {
+                "issues_found": [],
+                "confidence_in_current_list": 0.5,
+                "suggested_actions": [],
+                "should_continue": True,
+                "reasoning": "No JSON found"
+            }
+
+        # 反省履歴に追加
+        state["reflection_history"].append(reflection)
+
+        # 収束判定
+        if reflection["confidence_in_current_list"] >= 0.9 and not reflection["should_continue"]:
+            state["refinement_converged"] = True
+            logger.info("✓ Refinement converged (high confidence)")
+            print(f"✓ 収束しました（信頼度: {reflection['confidence_in_current_list']:.2f}）\n")
+        else:
+            logger.info(f"Confidence: {reflection['confidence_in_current_list']:.2f}, Issues: {len(reflection['issues_found'])}")
+            print(f"  信頼度: {reflection['confidence_in_current_list']:.2f}")
+            if reflection["issues_found"]:
+                print(f"  問題点: {len(reflection['issues_found'])}個検出")
+
+        return state
+
+    async def _node_stage25_refine_terms(self, state: TermExtractionState) -> TermExtractionState:
+        """Stage 2.5b: 改善実行ノード"""
+        from .prompts import get_term_refinement_prompt
+
+        reflection = state["reflection_history"][-1]
+
+        if not reflection["suggested_actions"] or state["refinement_converged"]:
+            logger.info("[Stage 2.5] No actions needed, skipping refinement")
+            print(f"✓ 改善不要、次のステージへ\n")
+            return state
+
+        logger.info("[Stage 2.5] Refining terms...")
+        print(f"[Stage 2.5] 改善アクション実行中...")
+
+        # 用語リストをJSON化
+        terms_json = json.dumps(state["technical_terms"], ensure_ascii=False, indent=2)
+
+        # LLM実行
+        prompt = get_term_refinement_prompt()
+        chain = prompt | self.llm
+
+        result = await chain.ainvoke({
+            "issues": "\n".join(reflection["issues_found"]),
+            "actions": "\n".join(reflection["suggested_actions"]),
+            "terms_json": terms_json
+        })
+
+        # アクションパース
+        import re
+        content = result.content if hasattr(result, 'content') else str(result)
+        json_match = re.search(r'\[.*\]', content, re.DOTALL)
+
+        if json_match:
+            try:
+                actions = json.loads(json_match.group(0))
+                removed_count = 0
+
+                for action in actions:
+                    if action.get("action") == "remove":
+                        term_name = action["term"]
+                        term_obj = next((t for t in state["technical_terms"]
+                                       if t["headword"] == term_name), None)
+                        if term_obj:
+                            state["technical_terms"].remove(term_obj)
+                            state["rejected_terms"].append({
+                                **term_obj,
+                                "rejection_reason": action.get("reason", "不明"),
+                                "rejected_at_stage25": state["refinement_iteration"]
+                            })
+                            removed_count += 1
+
+                    elif action.get("action") == "investigate":
+                        # 簡易実装: investigateはkeepとして扱う（RAG検索は省略）
+                        pass
+
+                logger.info(f"Refinement: removed {removed_count} terms")
+                print(f"✓ {removed_count}個の用語を除外しました\n")
+
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse refinement actions: {e}")
+                print(f"⚠️  改善アクションのパースに失敗\n")
+
+        state["refinement_iteration"] += 1
+        return state
+
+    def _should_continue_refinement(self, state: TermExtractionState) -> Literal["continue", "finish"]:
+        """Stage 2.5のループ制御"""
+
+        # 収束フラグチェック
+        if state.get("refinement_converged", False):
+            return "finish"
+
+        # 最大反復回数チェック
+        if state["refinement_iteration"] >= state["max_refinement_iterations"]:
+            logger.info("Max refinement iterations reached")
+            print(f"[Stage 2.5] 最大反復回数に達しました\n")
+            return "finish"
+
+        # ガード1: リストハッシュが前回と同じなら強制終了
+        current_hash = hash(frozenset(t["headword"] for t in state["technical_terms"]))
+        if state.get("previous_list_hash") is not None:
+            if state["previous_list_hash"] == current_hash:
+                logger.warning("Term list unchanged (hash match) - forcing convergence")
+                print(f"[Stage 2.5] 用語リストに変化なし - 収束と判定\n")
+                return "finish"
+        state["previous_list_hash"] = current_hash
+
+        # ガード2: 前回と同じ問題指摘なら強制終了
+        if len(state["reflection_history"]) >= 2:
+            last_issues = set(state["reflection_history"][-1].get("issues_found", []))
+            prev_issues = set(state["reflection_history"][-2].get("issues_found", []))
+            if last_issues and prev_issues:
+                overlap = len(last_issues & prev_issues) / max(len(last_issues), 1)
+                if overlap > 0.8:  # 80%重複
+                    logger.warning(f"Issue overlap {overlap:.1%} - forcing convergence")
+                    print(f"[Stage 2.5] 問題指摘が重複（{overlap:.0%}） - 収束と判定\n")
+                    return "finish"
+
+        # 反省履歴チェック
+        if state["reflection_history"]:
+            latest = state["reflection_history"][-1]
+            if latest["confidence_in_current_list"] >= 0.9:
+                return "finish"
+
+        return "continue"
+
+    async def _node_stage3_generate_definitions(self, state: TermExtractionState) -> TermExtractionState:
+        """Stage 3: 定義生成ノード"""
+        logger.info("[Stage 3] Generating definitions...")
+        print(f"[Stage 3] 定義を生成中 ({len(state['technical_terms'])}個の専門用語)...")
+
+        state["technical_terms"] = await self._generate_definitions_with_rag(state["technical_terms"])
+
+        logger.info(f"Stage 3 complete: {len(state['technical_terms'])} definitions generated")
+        print(f"✓ 定義生成が完了しました\n")
+
+        return state
+
+    async def _node_stage4_detect_synonyms(self, state: TermExtractionState) -> TermExtractionState:
+        """Stage 4: 類義語検出ノード"""
+        logger.info("[Stage 4] Detecting synonyms...")
+        print(f"[Stage 4] 類義語を検出中...")
+
+        # Stage 4a: 専門用語間の類義語
+        representative_terms = await self._detect_and_merge_term_synonyms(state["technical_terms"])
+
+        # Stage 4b: 代表語と候補の類義語
+        if representative_terms and state["candidates"]:
+            representative_terms = await self._detect_synonyms_with_candidates(
+                representative_terms,
+                state["candidates"]
+            )
+
+        state["technical_terms"] = representative_terms
+
+        logger.info(f"Stage 4 complete: {len(state['technical_terms'])} representative terms")
+        print(f"✓ 類義語検出が完了しました\n")
+
+        return state
+
+    async def _extract_terms_with_langgraph(self, text: str, output_dir: Optional[Path] = None) -> List[Dict[str, Any]]:
+        """LangGraphを使用した専門用語抽出（新実装）"""
+        logger.info("Starting LangGraph-based term extraction workflow...")
+
+        # テキストをチャンクに分割
+        chunk_size = getattr(self.config, 'llm_extraction_chunk_size', 3000)
+        chunks = self._split_text(text, chunk_size)
+
+        # 初期状態
+        initial_state: TermExtractionState = {
+            "text_chunks": chunks,
+            "candidates": [],
+            "technical_terms": [],
+            "rejected_terms": [],
+            "refinement_iteration": 0,
+            "max_refinement_iterations": getattr(self.config, 'max_refinement_iterations', 3),
+            "refinement_converged": False,
+            "reflection_history": [],
+            "output_dir": output_dir
+        }
+
+        # ワークフロー構築
+        workflow = await self._build_workflow()
+
+        # LangGraphワークフロー全体のトレース設定（1回のみ、無料枠節約）
+        from langchain_core.runnables import RunnableConfig
+        workflow_config = RunnableConfig(
+            run_name="[TermExtraction] LangGraph-Workflow",
+            tags=["term_extraction", "langgraph", "workflow"],
+            metadata={
+                "num_chunks": len(chunks),
+                "max_refinement_iterations": initial_state["max_refinement_iterations"],
+                "workflow_version": "v2_with_reflection_loop"
+            }
+        )
+
+        # 実行
+        final_state = await workflow.ainvoke(initial_state, config=workflow_config)
+
+        # 反省ログを保存
+        if output_dir:
+            reflection_log = output_dir / "reflection_log.json"
+            with open(reflection_log, "w", encoding="utf-8") as f:
+                json.dump({
+                    "reflections": final_state["reflection_history"],
+                    "iterations": final_state["refinement_iteration"],
+                    "converged": final_state["refinement_converged"],
+                    "final_term_count": len(final_state["technical_terms"]),
+                    "rejected_count": len(final_state["rejected_terms"])
+                }, f, ensure_ascii=False, indent=2)
+            logger.info(f"Reflection log saved to {reflection_log}")
+            print(f"✓ 反省ログを保存: {reflection_log}\n")
+
+        return final_state["technical_terms"]
 
 
 # ========== Utility Functions ==========

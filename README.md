@@ -12,18 +12,39 @@ LLMベースの専門用語抽出による辞書機能を実装したRAGA
 - **RAG定義生成**: LLMによる用語定義の自動生成
 - **類義語自動検出**: 候補プールから関連語を検出
 
-## 📚 専門用語抽出フロー
+## 📚 専門用語抽出フロー（LangGraph実装）
 
-LLMによる4段階処理:
+**LangGraphによるワークフロー型抽出** - 各ステージをノードとして実装し、State管理で柔軟な制御を実現
 
 ### Stage 1: 候補抽出（緩めに）
 - LLMが文書から専門用語候補を広く抽出
 - 定義は不要、用語名のみを収集
+- 並列処理でチャンクごとに候補を抽出
 
 ### Stage 2: 技術用語フィルタリング
 - 候補から真の専門用語のみを選別
 - 一般的すぎる語（「システム」「処理」など）を除外
 - 除外された語も類義語候補として保持👈専門用語ではない類義語を拾うため
+
+### Stage 2.5: 自己反省ループ（再帰的精緻化）⭐NEW
+**LangGraphの条件分岐を活用した品質管理ループ**
+
+- **2.5a Self-Reflection**: LLMが抽出結果を分析
+  - 誤検出（一般語の混入）をチェック
+  - 定義の妥当性を評価
+  - 見落とし（候補に残された有用語）を検出
+  - `confidence`, `should_continue` で収束判定
+
+- **2.5b Refinement**: 反省に基づき用語リストを改善
+  - `remove`: 一般語を除外
+  - `keep`: 専門用語として保持
+  - `investigate`: RAG検索でコンテキスト調査（簡易実装では省略）
+
+- **ループ制御**: 収束条件で自動終了
+  - 信頼度 >= 0.9
+  - 用語リストに変化なし（ハッシュ比較）
+  - 問題指摘が80%以上重複
+  - 最大反復回数到達（デフォルト3回）
 
 ### Stage 3: RAGベース定義生成
 - 専門用語に対してベクトルストアから関連文書を検索
@@ -34,43 +55,95 @@ LLMによる4段階処理:
 - LLMの一般知識は使用せず、文書内の語句のみ
 - 専門用語と一般表現の関連付け（例：「機械学習」と「学習」）
 
+### LangGraph ワークフローフロー図
+
+```mermaid
+graph TB
+    Start([開始]) --> Stage1[Stage 1:<br/>候補抽出]
+    Stage1 --> Stage2[Stage 2:<br/>初期フィルタリング]
+    Stage2 --> Stage25a[Stage 2.5a:<br/>Self-Reflection]
+
+    Stage25a --> Stage25b[Stage 2.5b:<br/>Refinement]
+
+    Stage25b --> Decision{収束判定}
+    Decision -->|continue<br/>・confidence < 0.9<br/>・リスト変化あり<br/>・問題重複 < 80%| Stage25a
+    Decision -->|finish<br/>・confidence >= 0.9<br/>・リスト変化なし<br/>・問題重複 >= 80%<br/>・最大反復到達| Stage3[Stage 3:<br/>RAG定義生成]
+
+    Stage3 --> Stage4[Stage 4:<br/>類義語検出]
+    Stage4 --> End([終了])
+
+    style Stage25a fill:#fff4e1
+    style Stage25b fill:#fff4e1
+    style Decision fill:#e1f5ff
+```
+
 ### シーケンス図
 
 ```mermaid
 sequenceDiagram
     participant User as ユーザー
     participant UI as Streamlit UI
+    participant WF as LangGraph Workflow
     participant TE as TermExtractor
     participant LLM as GPT-4o-mini
     participant VS as Vector Store
     participant DB as PostgreSQL
 
     User->>UI: ドキュメントをアップロード
-    UI->>TE: extract_from_documents()
+    UI->>WF: extract_from_documents()
 
-    Note over TE,LLM: Stage 1: 候補抽出
+    Note over WF,LLM: Stage 1: 候補抽出
+    WF->>TE: _node_stage1_extract_candidates
     TE->>LLM: 専門用語候補を抽出（緩め）
     LLM-->>TE: 候補リスト + 信頼度
+    TE-->>WF: state["candidates"] 更新
 
-    Note over TE,LLM: Stage 2: フィルタリング
+    Note over WF,LLM: Stage 2: 初期フィルタリング
+    WF->>TE: _node_stage2_initial_filter
     TE->>LLM: 真の専門用語を選別
     LLM-->>TE: 技術用語リスト
+    TE-->>WF: state["technical_terms"] 更新
 
-    Note over TE,VS: Stage 3: RAG定義生成
+    Note over WF,LLM: Stage 2.5: 自己反省ループ
+    loop 収束まで（最大3回）
+        WF->>TE: _node_stage25_self_reflection
+        TE->>LLM: 用語リストを分析（ランダムサンプル50個）
+        LLM-->>TE: 問題点 + confidence + should_continue
+        TE-->>WF: state["reflection_history"] 追加
+
+        WF->>TE: _node_stage25_refine_terms
+        TE->>LLM: 問題に基づきアクション決定
+        LLM-->>TE: remove/keep/investigate アクション
+        TE->>TE: 用語リスト更新
+        TE-->>WF: state["technical_terms"] 更新
+
+        WF->>WF: _should_continue_refinement
+        alt リスト変化なし OR 問題重複80%以上 OR confidence >= 0.9
+            WF->>WF: 収束と判定 → ループ終了
+        else 改善の余地あり
+            WF->>WF: ループ継続
+        end
+    end
+
+    Note over WF,VS: Stage 3: RAG定義生成
+    WF->>TE: _node_stage3_generate_definitions
     loop 各専門用語
         TE->>VS: similarity_search(用語)
         VS-->>TE: 関連文書
         TE->>LLM: 定義生成（文書ベース）
         LLM-->>TE: 定義
     end
+    TE-->>WF: state["technical_terms"] 更新
 
-    Note over TE,LLM: Stage 4: 類義語検出
+    Note over WF,LLM: Stage 4: 類義語検出
+    WF->>TE: _node_stage4_detect_synonyms
     TE->>LLM: 候補プールから類義語検出
     LLM-->>TE: 類義語・関連語
+    TE-->>WF: state["technical_terms"] 更新
 
-    TE->>DB: 用語辞書に登録
-    DB-->>TE: 登録完了
-    TE-->>UI: 抽出結果
+    WF->>DB: 用語辞書に登録
+    DB-->>WF: 登録完了
+    WF-->>UI: 抽出結果 + 反省ログ
     UI-->>User: 用語リスト表示
 ```
 

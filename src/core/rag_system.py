@@ -378,6 +378,9 @@ class RAGSystem:
 
     def _init_db(self):
         """Initialize database tables and extensions."""
+        import logging
+        logger = logging.getLogger(__name__)
+
         with self.engine.connect() as conn, conn.begin():
             # Enable pgvector extension
             conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
@@ -414,6 +417,21 @@ class RAGSystem:
             """))
             conn.execute(text("CREATE INDEX IF NOT EXISTS idx_parent_chunk_collection ON parent_child_chunks(collection_name)"))
             conn.execute(text("CREATE INDEX IF NOT EXISTS idx_parent_chunk_id ON parent_child_chunks(parent_chunk_id)"))
+
+            # HNSW vector index for langchain_pg_embedding table
+            # Note: This table is created by LangChain PGVector, but without index
+            # HNSW provides ~100x faster similarity search compared to sequential scan
+            try:
+                conn.execute(text("""
+                    CREATE INDEX IF NOT EXISTS langchain_pg_embedding_hnsw_idx
+                    ON langchain_pg_embedding
+                    USING hnsw (embedding vector_cosine_ops)
+                    WITH (m = 16, ef_construction = 64)
+                """))
+                logger.info("HNSW index created/verified for langchain_pg_embedding")
+            except Exception as e:
+                # Table might not exist yet (created on first document add)
+                logger.warning(f"Could not create HNSW index (table may not exist yet): {e}")
 
             # スキーマ検証とマイグレーション
             self._validate_and_migrate_schema(conn)

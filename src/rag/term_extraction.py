@@ -1162,6 +1162,9 @@ class TermExtractor:
 
                 logger.info(f"Grouped {len(terms)} terms into {len(representative_terms)} representative terms")
                 representative_terms = [self._clean_synonyms(t) for t in representative_terms]
+                if not representative_terms:
+                    logger.warning("Term grouping returned empty list; keeping original terms")
+                    return terms
                 return representative_terms
 
             except Exception as e:
@@ -1537,6 +1540,26 @@ class TermExtractor:
             except Exception as e:
                 logger.warning(f"UI callback failed: {e}")
 
+        # 反省結果スナップショット（デバッグ用）
+        if state.get("output_dir"):
+            try:
+                iter_idx = refinement_iteration + 1
+                snapshot = {
+                    "iteration": iter_idx,
+                    "max_iterations": max_iterations,
+                    "confidence": reflection.get("confidence_in_current_list"),
+                    "issues": reflection.get("issues_found", []),
+                    "suggested_actions": reflection.get("suggested_actions", []),
+                    "missing_terms": reflection.get("missing_terms", []),
+                    "terms_sample_size": len(json.loads(terms_json)) if terms_json else 0,
+                    "candidates_sample_size": len(json.loads(candidates_sample)) if candidates_sample else 0
+                }
+                snap_file = state["output_dir"] / f"stage25_reflection_iter{iter_idx}.json"
+                with open(snap_file, "w", encoding="utf-8") as f:
+                    json.dump(snapshot, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                logger.warning(f"Failed to save reflection snapshot: {e}")
+
         return state
 
     async def _node_stage25_refine_terms(self, state: TermExtractionState) -> TermExtractionState:
@@ -1544,6 +1567,11 @@ class TermExtractor:
         from .prompts import get_term_refinement_prompt
 
         reflection = state["reflection_history"][-1]
+        refinement_iteration = state.get("refinement_iteration", 0)
+        before_counts = {
+            "terms": len(state.get("technical_terms", [])),
+            "rejected": len(state.get("rejected_terms", []))
+        }
         removed_count = 0
         added_count = 0
 
@@ -1609,16 +1637,21 @@ class TermExtractor:
                     logger.error(f"Failed to parse refinement actions: {e}")
                     print(f"[WARN] 改善アクションのパースに失敗")
 
-        # 2. Missing追加処理（NEW）
+        # 2. Missing追加処理（RAG定義生成付き）
         missing_terms = reflection.get("missing_terms", [])
         if missing_terms:
-            logger.info(f"[Stage 2.5] Processing {len(missing_terms)} missing terms...")
-            print(f"[Stage 2.5] 漏れ用語を追加中 ({len(missing_terms)}個)...")
+            logger.info(f"[Stage 2.5] Processing {len(missing_terms)} missing terms with RAG...")
+            print(f"[Stage 2.5] 漏れ用語を追加中 ({len(missing_terms)}個、RAG定義生成)...")
 
             # デバッグ: missing_termsの構造を確認
             logger.debug(f"missing_terms structure: {type(missing_terms)}, first item: {missing_terms[0] if missing_terms else 'empty'}")
 
-            # missing → candidates形式に変換（JsonOutputParserは常にdictを返す）
+            # ハイブリッド検索が使用可能かチェック
+            use_hybrid = self.hybrid_retriever is not None
+            if not use_hybrid and not self.vector_store:
+                logger.warning("Neither hybrid retriever nor vector store available for missing terms definition generation")
+
+            # missing → candidates形式に変換 + RAG定義生成
             new_candidates = []
             for m in missing_terms:
                 # JsonOutputParserは常にdictを返すため、dict前提で処理
@@ -1632,15 +1665,36 @@ class TermExtractor:
                     logger.debug(f"Skipping duplicate missing term: {hw}")
                     continue
 
-                # 候補形式に変換（シンプルにdict access）
+                # ★ RAG検索で定義生成
+                definition = m.get("evidence", "")  # デフォルトはevidenceを使用
+                try:
+                    if use_hybrid:
+                        docs = await self.hybrid_retriever.ainvoke(hw)
+                    elif self.vector_store:
+                        docs = self.vector_store.similarity_search(hw, k=3)
+                    else:
+                        docs = []
+
+                    if docs:
+                        # 上位3件の文書から定義生成
+                        context = "\n".join([d.page_content[:500] for d in docs[:3]])
+                        definition = await self._generate_definition_for_missing_term(hw, context)
+                        logger.debug(f"Generated RAG definition for '{hw}': {definition[:50]}...")
+                    else:
+                        logger.debug(f"No RAG docs found for '{hw}', using evidence as definition")
+                except Exception as e:
+                    logger.warning(f"RAG definition generation failed for '{hw}': {e}")
+                    # エラー時はevidenceをフォールバック
+
+                # 候補形式に変換
                 new_candidates.append({
                     "headword": hw,
-                    "brief_definition": m.get("evidence", ""),
+                    "brief_definition": definition,  # ★ RAG定義またはevidence
                     "domain": m.get("suggested_domain"),
-                    "confidence": 0.6,  # 提案なので低め
-                    "source": "stage25_missing"
+                    "confidence": 0.65,  # RAG定義付きなので少し高め
+                    "source": "stage25_missing_with_rag"
                 })
-                logger.debug(f"Added missing term candidate: {hw} (evidence: {m.get('evidence', '')[:50]}...)")
+                logger.debug(f"Added missing term candidate: {hw} (definition: {definition[:50]}...)")
 
             if new_candidates:
                 logger.info(f"Filtered {len(new_candidates)} unique missing terms for Stage2 incremental filtering")
@@ -1678,7 +1732,29 @@ class TermExtractor:
         state["last_removed_count"] = removed_count
         state["last_added_count"] = added_count
 
-        state["refinement_iteration"] = state.get("refinement_iteration", 0) + 1
+        if state.get("output_dir"):
+            try:
+                iter_idx = refinement_iteration + 1
+                after_counts = {
+                    "terms": len(state.get("technical_terms", [])),
+                    "rejected": len(state.get("rejected_terms", []))
+                }
+                snapshot = {
+                    "iteration": iter_idx,
+                    "removed_count": removed_count,
+                    "added_count": added_count,
+                    "suggested_actions": reflection.get("suggested_actions", []),
+                    "missing_terms": missing_terms,
+                    "before_counts": before_counts,
+                    "after_counts": after_counts
+                }
+                snap_file = state["output_dir"] / f"stage25_action_iter{iter_idx}.json"
+                with open(snap_file, "w", encoding="utf-8") as f:
+                    json.dump(snapshot, f, ensure_ascii=False, indent=2)
+            except Exception as e:
+                logger.warning(f"Failed to save Stage2.5 action snapshot: {e}")
+
+        state["refinement_iteration"] = refinement_iteration + 1
         return state
 
     def _should_continue_refinement(self, state: TermExtractionState) -> Literal["continue", "finish"]:
@@ -1742,6 +1818,36 @@ class TermExtractor:
                 return "finish"
 
         return "continue"
+
+    async def _generate_definition_for_missing_term(self, term: str, context: str) -> str:
+        """Stage 2.5 の missing_terms 用の定義生成（簡易版）
+
+        Args:
+            term: 用語名
+            context: RAG検索で取得した文脈
+
+        Returns:
+            生成された定義（1-2文）
+        """
+        prompt_text = f"""以下の文脈から、専門用語「{term}」の簡潔な定義（1-2文、50文字以内）を生成してください。
+
+文脈:
+{context[:1000]}
+
+定義:"""
+
+        try:
+            result = await self.llm.ainvoke(prompt_text)
+            content = getattr(result, "content", None)
+            if content is None:
+                if hasattr(result, "strip"):
+                    content = result.strip()
+                else:
+                    content = str(result)
+            return content.strip()
+        except Exception as e:
+            logger.warning(f"Definition generation failed for '{term}': {e}")
+            return f"{term}に関する専門用語（定義生成エラー）"
 
     async def _node_stage3_generate_definitions(self, state: TermExtractionState) -> TermExtractionState:
         """Stage 3: 定義生成ノード"""

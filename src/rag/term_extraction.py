@@ -1899,14 +1899,14 @@ async def _get_graph_for_cli():
         return ChatOpenAI(model=model, temperature=temperature, api_key=api_key, max_tokens=max_tokens)
 
     def _build_azure_llm():
-        api_key = config.azure_openai_api_key or os.getenv("AZURE_OPENAI_API_KEY") or "DUMMY"
-        endpoint = config.azure_openai_endpoint or os.getenv("AZURE_OPENAI_ENDPOINT") or "https://dummy"
+        api_key = getattr(config, 'azure_openai_api_key', None) or os.getenv("AZURE_OPENAI_API_KEY") or "DUMMY"
+        endpoint = getattr(config, 'azure_openai_endpoint', None) or os.getenv("AZURE_OPENAI_ENDPOINT") or "https://dummy"
         deployment = (
-            config.azure_openai_chat_deployment_name
+            getattr(config, 'azure_openai_chat_deployment_name', None)
             or os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT_NAME")
             or "dummy"
         )
-        api_version = config.azure_openai_api_version
+        api_version = getattr(config, 'azure_openai_api_version', '2024-02-15-preview')
         return AzureChatOpenAI(
             azure_deployment=deployment,
             temperature=temperature,

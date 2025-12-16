@@ -258,16 +258,16 @@ class RAGSystem:
         self.llm = AzureChatOpenAI(
             temperature=getattr(self.config, 'llm_temperature', 0.0),
             max_tokens=getattr(self.config, 'max_tokens', 4096),
-            azure_deployment=self.config.azure_openai_chat_deployment_name,
-            api_key=self.config.azure_openai_api_key,
-            azure_endpoint=self.config.azure_openai_endpoint,
-            api_version=self.config.azure_openai_api_version
+            azure_deployment=getattr(self.config, 'azure_openai_chat_deployment_name', 'gpt-4o-mini'),
+            api_key=getattr(self.config, 'azure_openai_api_key', ''),
+            azure_endpoint=getattr(self.config, 'azure_openai_endpoint', ''),
+            api_version=getattr(self.config, 'azure_openai_api_version', '2024-02-15-preview')
         )
         self.embeddings = AzureOpenAIEmbeddings(
-            azure_deployment=self.config.azure_openai_embedding_deployment_name,
-            api_key=self.config.azure_openai_api_key,
-            azure_endpoint=self.config.azure_openai_endpoint,
-            api_version=self.config.azure_openai_api_version
+            azure_deployment=getattr(self.config, 'azure_openai_embedding_deployment_name', 'text-embedding-3-small'),
+            api_key=getattr(self.config, 'azure_openai_api_key', ''),
+            azure_endpoint=getattr(self.config, 'azure_openai_endpoint', ''),
+            api_version=getattr(self.config, 'azure_openai_api_version', '2024-02-15-preview')
         )
 
     def _init_huggingface_models(self):
@@ -369,10 +369,10 @@ class RAGSystem:
 
         # For embeddings, we still use Azure OpenAI (VLLM doesn't provide embedding models)
         self.embeddings = AzureOpenAIEmbeddings(
-            azure_deployment=self.config.azure_openai_embedding_deployment_name,
-            api_key=self.config.azure_openai_api_key,
-            azure_endpoint=self.config.azure_openai_endpoint,
-            api_version=self.config.azure_openai_api_version
+            azure_deployment=getattr(self.config, 'azure_openai_embedding_deployment_name', 'text-embedding-3-small'),
+            api_key=getattr(self.config, 'azure_openai_api_key', ''),
+            azure_endpoint=getattr(self.config, 'azure_openai_endpoint', ''),
+            api_version=getattr(self.config, 'azure_openai_api_version', '2024-02-15-preview')
         )
         logger.info("Using Azure OpenAI embeddings with VLLM generation")
 

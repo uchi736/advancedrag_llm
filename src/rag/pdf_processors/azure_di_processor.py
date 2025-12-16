@@ -59,12 +59,16 @@ class AzureDocumentIntelligenceProcessor:
             )
         
         # 画像要約用のLLM初期化
-        if all([config.azure_openai_api_key, config.azure_openai_endpoint, config.azure_openai_chat_deployment_name]):
+        azure_api_key = getattr(config, 'azure_openai_api_key', None)
+        azure_endpoint = getattr(config, 'azure_openai_endpoint', None)
+        azure_deployment = getattr(config, 'azure_openai_chat_deployment_name', None)
+
+        if all([azure_api_key, azure_endpoint, azure_deployment]):
             self.llm = AzureChatOpenAI(
-                azure_endpoint=config.azure_openai_endpoint,
-                api_key=config.azure_openai_api_key,
-                api_version=config.azure_openai_api_version,
-                azure_deployment=config.azure_openai_chat_deployment_name,
+                azure_endpoint=azure_endpoint,
+                api_key=azure_api_key,
+                api_version=getattr(config, 'azure_openai_api_version', '2024-02-15-preview'),
+                azure_deployment=azure_deployment,
                 temperature=0.1,
                 max_tokens=512
             )

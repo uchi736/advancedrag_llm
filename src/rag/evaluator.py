@@ -89,9 +89,30 @@ class RAGEvaluator:
             azure_deployment=config.azure_openai_embedding_deployment_name
         )
         
-        # Model names from config
-        self.embedding_model = config.azure_openai_embedding_deployment_name
-        self.llm_model = config.azure_openai_chat_deployment_name
+        # Model names from config (support multiple providers)
+        provider = getattr(config, 'llm_provider', 'azure') or 'azure'
+
+        if provider == "azure":
+            self.embedding_model = config.azure_openai_embedding_deployment_name or "text-embedding-3-small"
+            self.llm_model = config.azure_openai_chat_deployment_name or "gpt-4o-mini"
+        elif provider == "vllm":
+            # VLLM uses Azure embeddings, but VLLM for generation
+            self.embedding_model = config.azure_openai_embedding_deployment_name or "text-embedding-3-small"
+            self.llm_model = "vllm"
+        elif provider in ("huggingface", "huggingface_local"):
+            self.embedding_model = config.hf_embedding_model_id or "intfloat/multilingual-e5-large"
+            self.llm_model = config.hf_model_id or "huggingface-model"
+        elif provider == "openai":
+            self.embedding_model = "text-embedding-3-small"
+            self.llm_model = "gpt-4o-mini"
+        elif provider == "gemini":
+            # Gemini uses Azure embeddings typically
+            self.embedding_model = config.azure_openai_embedding_deployment_name or "text-embedding-3-small"
+            self.llm_model = "gemini-1.5-pro"
+        else:
+            # Fallback to Azure defaults
+            self.embedding_model = getattr(config, 'azure_openai_embedding_deployment_name', 'text-embedding-3-small')
+            self.llm_model = getattr(config, 'azure_openai_chat_deployment_name', 'gpt-4o-mini')
 
     def load_csv_data(self, csv_path: str) -> pd.DataFrame:
         """Load evaluation data from CSV file"""

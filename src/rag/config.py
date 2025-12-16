@@ -23,7 +23,7 @@ class Config:
     azure_openai_embedding_deployment_name: Optional[str] = None
 
     # LLM Provider settings (populated in __post_init__)
-    llm_provider: str = ""  # "azure" or "huggingface"
+    llm_provider: Optional[str] = None  # "azure", "huggingface", "vllm", "openai", "gemini"
 
     # Hugging Face settings (populated in __post_init__)
     hf_model_id: str = ""
@@ -35,6 +35,16 @@ class Config:
     hf_temperature: float = 0.0
     hf_top_k: int = 0
     hf_top_p: float = 0.0
+
+    # VLLM settings (populated in __post_init__)
+    vllm_endpoint: Optional[str] = None
+    vllm_temperature: float = 0.0
+    vllm_top_p: float = 0.7
+    vllm_top_k: int = 5
+    vllm_min_p: float = 0.0
+    vllm_max_tokens: int = 4096
+    vllm_reasoning_effort: str = "medium"
+    vllm_timeout: int = 60
 
     # LLM settings (populated in __post_init__)
     llm_temperature: float = 0.0
@@ -71,8 +81,15 @@ class Config:
         self.azure_openai_chat_deployment_name = os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT_NAME")
         self.azure_openai_embedding_deployment_name = os.getenv("AZURE_OPENAI_EMBEDDING_DEPLOYMENT_NAME")
 
-        # LLM Provider settings
-        self.llm_provider = os.getenv("LLM_PROVIDER", "azure")
+        # LLM Provider settings (UIから渡された値を優先、空の場合のみ環境変数を使用)
+        env_llm_provider = os.getenv("LLM_PROVIDER")
+        if self.llm_provider not in (None, ""):
+            # Value explicitly provided (e.g., from UI form) takes priority
+            pass
+        elif env_llm_provider:
+            self.llm_provider = env_llm_provider
+        else:
+            self.llm_provider = "azure"
 
         # Hugging Face settings
         self.hf_model_id = os.getenv("HF_MODEL_ID", "tokyotech-llm/Llama-3.1-Swallow-8B-Instruct-v0.3")
@@ -84,6 +101,16 @@ class Config:
         self.hf_temperature = float(os.getenv("HF_TEMPERATURE", "0.0"))
         self.hf_top_k = int(os.getenv("HF_TOP_K", "50"))
         self.hf_top_p = float(os.getenv("HF_TOP_P", "0.9"))
+
+        # VLLM settings
+        self.vllm_endpoint = os.getenv("VLLM_ENDPOINT")
+        self.vllm_temperature = float(os.getenv("VLLM_TEMPERATURE", "0.0"))
+        self.vllm_top_p = float(os.getenv("VLLM_TOP_P", "0.7"))
+        self.vllm_top_k = int(os.getenv("VLLM_TOP_K", "5"))
+        self.vllm_min_p = float(os.getenv("VLLM_MIN_P", "0.0"))
+        self.vllm_max_tokens = int(os.getenv("VLLM_MAX_TOKENS", "4096"))
+        self.vllm_reasoning_effort = os.getenv("VLLM_REASONING_EFFORT", "medium")
+        self.vllm_timeout = int(os.getenv("VLLM_TIMEOUT", "60"))
 
         # LLM settings
         self.llm_temperature = float(os.getenv("LLM_TEMPERATURE", "0.0"))

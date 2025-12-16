@@ -246,6 +246,9 @@ class RAGSystem:
         if provider == "huggingface":
             logger.info("RAGSystem initialized with Hugging Face local models.")
             self._init_huggingface_models()
+        elif provider == "vllm":
+            logger.info("RAGSystem initialized with VLLM.")
+            self._init_vllm_models()
         else:
             logger.info("RAGSystem initialized with Azure OpenAI.")
             self._init_azure_openai_models()
@@ -341,6 +344,37 @@ class RAGSystem:
         except Exception as e:
             logger.error(f"Failed to load Hugging Face embeddings: {e}")
             raise
+
+    def _init_vllm_models(self):
+        """Initialize VLLM models."""
+        from src.rag.vllm_client import VLLMChatClient
+        import logging
+        logger = logging.getLogger(__name__)
+
+        if not self.config.vllm_endpoint:
+            raise ValueError("VLLM endpoint is required for vllm provider")
+
+        # Initialize VLLM LLM
+        self.llm = VLLMChatClient(
+            endpoint=self.config.vllm_endpoint,
+            temperature=self.config.vllm_temperature,
+            top_p=self.config.vllm_top_p,
+            top_k=self.config.vllm_top_k,
+            min_p=self.config.vllm_min_p,
+            max_tokens=self.config.vllm_max_tokens,
+            reasoning_effort=self.config.vllm_reasoning_effort,
+            timeout=self.config.vllm_timeout
+        )
+        logger.info(f"Loaded VLLM client from endpoint: {self.config.vllm_endpoint}")
+
+        # For embeddings, we still use Azure OpenAI (VLLM doesn't provide embedding models)
+        self.embeddings = AzureOpenAIEmbeddings(
+            azure_deployment=self.config.azure_openai_embedding_deployment_name,
+            api_key=self.config.azure_openai_api_key,
+            azure_endpoint=self.config.azure_openai_endpoint,
+            api_version=self.config.azure_openai_api_version
+        )
+        logger.info("Using Azure OpenAI embeddings with VLLM generation")
 
     def _init_db(self):
         """Initialize database tables and extensions."""
@@ -581,7 +615,7 @@ class RAGSystem:
                     # Multi-query retrieval + RRF
                     all_results = []
                     for query in queries:
-                        docs = self.retriever.get_relevant_documents(query)
+                        docs = self.retriever.invoke(query)
                         all_results.append(docs)
 
                     # Apply RRF
@@ -594,7 +628,7 @@ class RAGSystem:
                 else:
                     # Single query retrieval
                     query = queries[0] if queries else inputs.get("question", "")
-                    inputs["documents"] = self.retriever.get_relevant_documents(query)[:self.config.final_k] if query else []
+                    inputs["documents"] = self.retriever.invoke(query)[:self.config.final_k] if query else []
                     inputs["golden_retriever"] = {"enabled": False}
 
             except Exception as e:

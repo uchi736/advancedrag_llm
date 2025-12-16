@@ -18,20 +18,21 @@ import json
 import logging
 import operator
 from pathlib import Path
-from typing import Dict, List, Optional, Any, Annotated, Literal
+from typing import Dict, List, Optional, Any, Annotated, Literal, TypedDict
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from langchain_openai import ChatOpenAI, AzureChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
+from langchain.output_parsers.fix import OutputFixingParser
+from langchain_core.exceptions import OutputParserException
 from langchain_core.documents import Document
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, RootModel
 import asyncio
 from tqdm import tqdm
 
 # LangGraph imports
 from langgraph.graph import StateGraph, END
-from typing import TypedDict
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,13 @@ class FilteredTermResult(BaseModel):
     rejected: List[ExtractedTerm] = Field(description="除外された用語（rejection_reason付き）")
 
 
+class MissingTerm(BaseModel):
+    """Stage 2.5: 漏れている用語候補"""
+    term: str = Field(description="漏れている用語")
+    evidence: Optional[str] = Field(default=None, description="必要と判断した文脈・根拠")
+    suggested_domain: Optional[str] = Field(default=None, description="推定分野")
+
+
 class ReflectionResult(BaseModel):
     """Stage 2.5: 自己反省の結果"""
     issues_found: List[str] = Field(description="発見された問題点")
@@ -65,6 +73,29 @@ class ReflectionResult(BaseModel):
     suggested_actions: List[str] = Field(description="推奨される改善アクション")
     should_continue: bool = Field(description="反復を続けるべきか")
     reasoning: str = Field(description="判断の理由")
+    missing_terms: List[MissingTerm] = Field(default_factory=list, description="候補から追加すべき漏れ用語")
+
+
+# 類義語グループ用（Stage4）
+class SynonymGroup(BaseModel):
+    headword: str
+    synonyms: List[str] = Field(default_factory=list)
+    definition: Optional[str] = ""
+    domain: Optional[str] = "一般"
+
+
+class SynonymGroupList(RootModel[List[SynonymGroup]]):
+    pass
+
+
+class SynonymMap(BaseModel):
+    term: str
+    synonyms: List[str] = Field(default_factory=list)
+    domain: Optional[str] = None
+
+
+class SynonymMapList(RootModel[List[SynonymMap]]):
+    pass
 
 
 # ========== LangGraph State ==========
@@ -90,6 +121,8 @@ class TermExtractionState(TypedDict):
     refinement_converged: bool  # 収束フラグ
     reflection_history: Annotated[List[Dict], _overwrite_list]  # 反省履歴（上書き）
     previous_list_hash: Optional[int]  # 前回のリストハッシュ（変更検知用）
+    last_added_count: int  # 前回の追加数（収束判定用）
+    last_removed_count: int  # 前回の削除数（収束判定用）
 
     # 出力ディレクトリ
     output_dir: Optional[Path]
@@ -361,7 +394,15 @@ class TermExtractor:
 
         # プロンプトとパーサーの初期化
         self._init_prompts()
-        self.json_parser = JsonOutputParser(pydantic_object=ExtractedTermList)
+        # JSONパース補正付きパーサー（LLMが崩れたJSONを返す場合の保険）
+        self.json_parser = self._build_fixing_parser(ExtractedTermList)
+        self.term_group_parser = self._build_fixing_parser(SynonymGroupList)
+        self.synonym_map_parser = self._build_fixing_parser(SynonymMapList)
+        # LangChainの出力がAIMessageになる場合に備えて、contentを取り出すユーティリティ
+        from langchain_core.runnables import RunnableLambda
+        self._to_text = RunnableLambda(lambda x: x.content if hasattr(x, "content") else x)
+        # 構造化出力対応LLM（response_format=json_schema）が利用可能なら差し替える
+        self._init_structured_llms()
 
         # PDF プロセッサー（必要に応じて）
         self.pdf_processor = None
@@ -432,6 +473,38 @@ class TermExtractor:
         self.technical_term_filter_prompt = get_technical_term_filter_prompt()
         self.term_synonym_grouping_prompt = get_term_synonym_grouping_prompt()
         self.synonym_prompt = get_synonym_detection_prompt()
+
+    def _build_fixing_parser(self, pydantic_obj):
+        """LLMのJSON崩れを補正するパーサーを生成"""
+        base = JsonOutputParser(pydantic_object=pydantic_obj)
+        return OutputFixingParser.from_llm(
+            llm=self.llm,
+            parser=base,
+            max_retries=2
+        )
+
+    def _init_structured_llms(self):
+        """LLMがjson_schemaレスポンスをサポートしていれば、構造化版を用意"""
+        self._structured_llms = {}
+
+        def _try_bind(name: str, model) -> None:
+            try:
+                schema = model.model_json_schema()
+                bound = self.llm.bind(
+                    response_format={
+                        "type": "json_schema",
+                        "json_schema": {"name": name, "schema": schema}
+                    }
+                )
+                self._structured_llms[name] = bound
+                logger.info(f"Structured output bound for {name}")
+            except Exception as e:
+                logger.debug(f"Structured output not available for {name}: {e}")
+
+        _try_bind("candidate", ExtractedTermList)
+        _try_bind("filter", FilteredTermResult)
+        _try_bind("term_group", SynonymGroupList)
+        _try_bind("synonym_map", SynonymMapList)
 
     async def extract_from_documents(self, file_paths: List[Path], output_dir: Optional[Path] = None) -> Dict[str, Any]:
         """複数の文書から専門用語を抽出"""
@@ -520,7 +593,7 @@ class TermExtractor:
         print(f"\n[Stage 1] チャンクから候補抽出中 ({len(chunks)}個のチャンク)...")
 
         all_candidates = []
-        chain = self.candidate_extraction_prompt | self.llm | self.json_parser
+        chain = self.candidate_extraction_prompt | self.llm | self._to_text | self.json_parser
 
         async def extract_from_chunk(i: int, chunk: str):
             """1つのチャンクから候補を抽出"""
@@ -584,7 +657,7 @@ class TermExtractor:
         # 候補の重複除去
         unique_candidates = self._merge_duplicates(all_candidates)
         logger.info(f"Stage 1 complete: {len(unique_candidates)} unique candidates extracted")
-        print(f"✓ {len(unique_candidates)}個の候補を抽出しました\n")
+        print(f"[OK] {len(unique_candidates)}個の候補を抽出しました\n")
 
         # Stage 1結果をファイルに出力
         if output_dir:
@@ -593,7 +666,7 @@ class TermExtractor:
             with open(stage1_file, "w", encoding="utf-8") as f:
                 json.dump({"candidates": unique_candidates}, f, ensure_ascii=False, indent=2)
             logger.info(f"Stage 1 results saved to {stage1_file}")
-            print(f"✓ Stage 1 結果を保存: {stage1_file}\n")
+            print(f"[OK] Stage 1 結果を保存: {stage1_file}\n")
 
         # ========== 第2段階: 専門用語の選別 ==========
         technical_terms = []
@@ -603,7 +676,7 @@ class TermExtractor:
             print(f"[Stage 2] 専門用語を選別中...")
             technical_terms = await self._filter_technical_terms(unique_candidates, output_dir=output_dir)
             logger.info(f"Stage 2 complete: {len(technical_terms)} technical terms selected")
-            print(f"✓ {len(technical_terms)}個の専門用語を選別しました\n")
+            print(f"[OK] {len(technical_terms)}個の専門用語を選別しました\n")
 
             # Stage 2結果をファイルに出力
             if output_dir:
@@ -611,14 +684,14 @@ class TermExtractor:
                 with open(stage2_file, "w", encoding="utf-8") as f:
                     json.dump({"technical_terms": technical_terms}, f, ensure_ascii=False, indent=2)
                 logger.info(f"Stage 2 results saved to {stage2_file}")
-                print(f"✓ Stage 2 結果を保存: {stage2_file}\n")
+                print(f"[OK] Stage 2 結果を保存: {stage2_file}\n")
 
         # ========== 第3段階: RAGベースの定義生成（専門用語のみ） ==========
         if technical_terms and self.vector_store:
             logger.info("Stage 3: Generating definitions using RAG for technical terms")
             print(f"[Stage 3] 定義を生成中 ({len(technical_terms)}個の専門用語)...")
             technical_terms = await self._generate_definitions_with_rag(technical_terms)
-            print(f"✓ 定義生成が完了しました\n")
+            print(f"[OK] 定義生成が完了しました\n")
         else:
             logger.info("Stage 3: Skipping definition generation (no vector store)")
             print(f"[Stage 3] ベクトルストアがないため定義生成をスキップします\n")
@@ -709,6 +782,28 @@ class TermExtractor:
 
         return list(merged.values())
 
+    def _clean_synonyms(self, term: Dict) -> Dict:
+        """類義語リストからheadword自身や空文字を除去し、重複を排除"""
+        head = term.get("headword", "")
+        head_lower = head.lower().strip() if head else ""
+        cleaned = []
+        seen = set()
+        for syn in term.get("synonyms", []):
+            if not syn:
+                continue
+            syn_str = str(syn).strip()
+            if not syn_str:
+                continue
+            syn_lower = syn_str.lower()
+            if syn_lower == head_lower:
+                continue
+            if syn_lower in seen:
+                continue
+            seen.add(syn_lower)
+            cleaned.append(syn_str)
+        term["synonyms"] = cleaned
+        return term
+
     async def _filter_technical_terms(self, candidates: List[Dict], output_dir: Optional[Path] = None) -> List[Dict]:
         """候補から専門用語を選別（第2段階）- バッチ処理対応"""
         if not candidates:
@@ -718,9 +813,9 @@ class TermExtractor:
             # バッチサイズを取得
             batch_size = getattr(self.config, 'stage2_batch_size', 50)
 
-            # FilteredTermResult用のパーサーを使用
-            from langchain_core.output_parsers import JsonOutputParser
-            filter_parser = JsonOutputParser(pydantic_object=FilteredTermResult)
+            # FilteredTermResult用のパーサーを使用（補正付き）
+            filter_parser = self._build_fixing_parser(FilteredTermResult)
+            llm_for_stage2 = self._structured_llms.get("filter", self.llm)
 
             # 候補をバッチに分割
             batches = [candidates[i:i + batch_size] for i in range(0, len(candidates), batch_size)]
@@ -749,24 +844,31 @@ class TermExtractor:
                     }
                 ) if batch_idx == 0 else None
 
-                chain = self.technical_term_filter_prompt | self.llm | filter_parser
-                result = await chain.ainvoke({
-                    "candidates_json": candidates_json,
-                    "format_instructions": filter_parser.get_format_instructions()
-                }, config=config)
+                try:
+                    chain = self.technical_term_filter_prompt | llm_for_stage2 | self._to_text | filter_parser
+                    result = await chain.ainvoke({
+                        "candidates_json": candidates_json,
+                        "format_instructions": filter_parser.get_format_instructions()
+                    }, config=config)
 
-                # 結果の処理
-                selected_terms = []
-                rejected_terms = []
+                    # 結果の処理
+                    selected_terms = []
+                    rejected_terms = []
 
-                if hasattr(result, "selected"):
-                    selected_terms = result.selected
-                    rejected_terms = result.rejected
-                elif isinstance(result, dict):
-                    selected_terms = result.get("selected", [])
-                    rejected_terms = result.get("rejected", [])
+                    if hasattr(result, "selected"):
+                        selected_terms = result.selected
+                        rejected_terms = result.rejected
+                    elif isinstance(result, dict):
+                        selected_terms = result.get("selected", [])
+                        rejected_terms = result.get("rejected", [])
 
-                return (selected_terms, rejected_terms)
+                    return (selected_terms, rejected_terms)
+
+                except Exception as e:
+                    logger.error(f"Stage2 batch {batch_idx} parsing failed: {e}")
+                    print(f"[WARN] Stage2 バッチ {batch_idx+1} のパースに失敗。バッチ全体を 'selected' として扱います。")
+                    # フォールバック: 元バッチをそのまま選定扱いで返す
+                    return (batch, [])
 
             # バッチを並列処理（プログレスバー付き）
             tasks = [process_batch(i, batch) for i, batch in enumerate(batches)]
@@ -816,13 +918,26 @@ class TermExtractor:
                 with open(stage2_rejected_file, "w", encoding="utf-8") as f:
                     json.dump({"rejected_terms": rejected_output}, f, ensure_ascii=False, indent=2)
                 logger.info(f"Stage 2 rejected terms saved to {stage2_rejected_file}")
-                print(f"✓ Stage 2 除外用語を保存: {stage2_rejected_file} ({len(rejected_output)}個)\n")
+                print(f"[OK] Stage 2 除外用語を保存: {stage2_rejected_file} ({len(rejected_output)}個)\n")
 
             # 検証: selected + rejected = total candidates
             processed_count = len(output) + len(rejected_output)
             if processed_count != len(candidates):
                 logger.warning(f"Validation failed: {processed_count} processed (selected: {len(output)}, rejected: {len(rejected_output)}) != {len(candidates)} input candidates. Missing: {len(candidates) - processed_count}")
-                print(f"⚠️  警告: 処理済み用語数 ({processed_count}) が入力候補数 ({len(candidates)}) と一致しません。未処理: {len(candidates) - processed_count}個\n")
+                print(f"[WARN] 警告: 処理済み用語数 ({processed_count}) が入力候補数 ({len(candidates)}) と一致しません。未処理: {len(candidates) - processed_count}個\n")
+                # フォールバック: 未処理候補を選定扱いで追加
+                missing = len(candidates) - processed_count
+                if missing > 0:
+                    # 既に処理済みの headword を控える
+                    done = {t.get("headword") for t in output} | {t.get("headword") for t in rejected_output}
+                    for cand in candidates:
+                        hw = cand.get("headword")
+                        if hw not in done:
+                            output.append(cand)
+                            done.add(hw)
+                            if len(output) + len(rejected_output) == len(candidates):
+                                break
+                    print(f"[OK] 未処理 {missing} 件をフォールバックで追加しました\n")
 
             logger.info(f"Technical term filtering: {len(output)} selected, {len(rejected_output)} rejected from {len(candidates)} candidates")
             return output
@@ -851,7 +966,7 @@ class TermExtractor:
         from langchain_core.output_parsers import StrOutputParser
 
         prompt = get_definition_generation_prompt()
-        chain = prompt | self.llm | StrOutputParser()
+        chain = prompt | self.llm | self._to_text | StrOutputParser()
 
         # セマフォで並列数を制限（DB接続負荷対策）
         semaphore = asyncio.Semaphore(10)
@@ -985,7 +1100,7 @@ class TermExtractor:
                     all_representative_terms.extend(batch_result)
 
                 logger.info(f"Grouped {len(technical_terms)} terms into {len(all_representative_terms)} representative terms (batched)")
-                print(f"✓ {len(technical_terms)}個の専門用語を{len(all_representative_terms)}個の代表語に集約しました\n")
+                print(f"[OK] {len(technical_terms)}個の専門用語を{len(all_representative_terms)}個の代表語に集約しました\n")
                 return all_representative_terms
 
             # 50個以下の場合は一括処理
@@ -993,7 +1108,7 @@ class TermExtractor:
 
         except Exception as e:
             logger.error(f"Term synonym detection failed: {e}")
-            print(f"⚠️  専門用語間の類義語判定でエラーが発生しました: {e}\n")
+            print(f"[WARN] 専門用語間の類義語判定でエラーが発生しました: {e}\n")
             return technical_terms
 
     async def _group_terms_batch(self, terms: List[Dict]) -> List[Dict]:
@@ -1018,7 +1133,8 @@ class TermExtractor:
                 }
             )
 
-            chain = self.term_synonym_grouping_prompt | self.llm
+            llm_for_stage4a = self._structured_llms.get("term_group", self.llm)
+            chain = self.term_synonym_grouping_prompt | llm_for_stage4a | self._to_text
             result = await chain.ainvoke({
                 "technical_terms_json": technical_terms_json
             }, config=config)
@@ -1029,47 +1145,30 @@ class TermExtractor:
             else:
                 result_text = str(result)
 
-            # JSONとして解析
             try:
-                # JSONブロックを抽出（```json ... ``` の場合に対応）
-                import re
-                json_match = re.search(r'```json\s*(\[.*?\])\s*```', result_text, re.DOTALL)
-                if json_match:
-                    result_text = json_match.group(1)
-                else:
-                    # ```なしの場合、配列部分のみ抽出
-                    array_match = re.search(r'\[.*\]', result_text, re.DOTALL)
-                    if array_match:
-                        result_text = array_match.group(0)
+                parsed = self.term_group_parser.parse(result_text)
+                groups = parsed.__root__ if hasattr(parsed, "__root__") else parsed
 
-                # JSONとして不正な文字を修正（LLMがコメント付きで出力する場合）
-                # // コメントを削除
-                result_text = re.sub(r'//.*', '', result_text)
-
-                grouped_terms = json.loads(result_text)
-
-                # 辞書形式に変換
                 representative_terms = []
-                for group in grouped_terms:
-                    if isinstance(group, dict):
-                        term_dict = {
-                            "headword": group.get("headword", ""),
-                            "synonyms": group.get("synonyms", []),
-                            "definition": group.get("definition", ""),
-                            "domain": group.get("domain", "一般")
-                        }
-                        representative_terms.append(term_dict)
+                for group in groups:
+                    g = group if isinstance(group, dict) else group.dict()
+                    term_dict = {
+                        "headword": g.get("headword", ""),
+                        "synonyms": g.get("synonyms", []),
+                        "definition": g.get("definition", ""),
+                        "domain": g.get("domain", "一般")
+                    }
+                    representative_terms.append(term_dict)
 
                 logger.info(f"Grouped {len(terms)} terms into {len(representative_terms)} representative terms")
-
+                representative_terms = [self._clean_synonyms(t) for t in representative_terms]
                 return representative_terms
 
-            except json.JSONDecodeError as e:
+            except Exception as e:
                 logger.error(f"Failed to parse term grouping result: {e}")
                 logger.error(f"Result text (first 1000 chars): {result_text[:1000]}")
                 logger.error(f"Result text (last 500 chars): {result_text[-500:]}")
-                # エラー時は元の用語リストをそのまま返す
-                print(f"⚠️  バッチのグループ化に失敗しました。\n")
+                print(f"[WARN] バッチのグループ化に失敗しました。\n")
                 print(f"   JSONパースエラー: {e}\n")
                 print(f"   LLM出力の最初: {result_text[:200]}...\n")
                 return terms
@@ -1095,7 +1194,7 @@ class TermExtractor:
 
             if not general_candidates:
                 logger.info("No general candidates found, skipping candidate synonym detection")
-                print(f"✓ 一般語候補がないため、この段階をスキップします\n")
+                print(f"[OK] 一般語候補がないため、この段階をスキップします\n")
                 return representative_terms
 
             # 代表語と候補をJSON化
@@ -1111,7 +1210,8 @@ class TermExtractor:
             )
 
             # 類義語検出
-            chain = self.synonym_prompt | self.llm
+            llm_for_stage4b = self._structured_llms.get("synonym_map", self.llm)
+            chain = self.synonym_prompt | llm_for_stage4b | self._to_text
             result = await chain.ainvoke({
                 "representative_terms_json": representative_terms_json,
                 "candidates_json": candidates_json
@@ -1123,46 +1223,29 @@ class TermExtractor:
             else:
                 result_text = str(result)
 
-            # JSONとして解析
             try:
-                # JSONブロックを抽出（```json ... ``` の場合に対応）
-                import re
-                json_match = re.search(r'```json\s*(\[.*?\])\s*```', result_text, re.DOTALL)
-                if json_match:
-                    result_text = json_match.group(1)
-                else:
-                    # ```なしの場合、配列部分のみ抽出
-                    array_match = re.search(r'\[.*\]', result_text, re.DOTALL)
-                    if array_match:
-                        result_text = array_match.group(0)
+                parsed = self.synonym_map_parser.parse(result_text)
+                syn_items = parsed.__root__ if hasattr(parsed, "__root__") else parsed
 
-                # JSONとして不正な文字を修正（LLMがコメント付きで出力する場合）
-                # // コメントを削除
-                result_text = re.sub(r'//.*', '', result_text)
-
-                synonym_data = json.loads(result_text)
-
-                # 代表語リストに一般語候補からの類義語を追加
                 for term in representative_terms:
                     headword = term.get("headword", "")
-
-                    # synonym_dataから該当する用語を探す
-                    for syn_item in synonym_data:
-                        if isinstance(syn_item, dict) and syn_item.get("term") == headword:
-                            new_synonyms = syn_item.get("synonyms", [])
+                    for syn_item in syn_items:
+                        item_dict = syn_item if isinstance(syn_item, dict) else syn_item.dict()
+                        if item_dict.get("term") == headword:
+                            new_synonyms = item_dict.get("synonyms", [])
                             existing_synonyms = set(term.get("synonyms", []))
-                            # 一般語候補からの類義語も含める
                             term["synonyms"] = list(existing_synonyms | set(new_synonyms))
+                            self._clean_synonyms(term)
                             break
 
                 logger.info(f"Added general term synonyms to {len(representative_terms)} representative terms")
-                print(f"✓ 代表語に一般語の類義語を追加しました\n")
+                print(f"[OK] 代表語に一般語の類義語を追加しました\n")
 
-            except json.JSONDecodeError as e:
+            except Exception as e:
                 logger.error(f"Failed to parse synonym detection result: {e}")
                 logger.error(f"Result text (first 1000 chars): {result_text[:1000]}")
                 logger.error(f"Result text (last 500 chars): {result_text[-500:]}")
-                print(f"⚠️  類義語判定結果のパースに失敗しました\n")
+                print(f"[WARN] 類義語判定結果のパースに失敗しました\n")
                 print(f"   JSONパースエラー: {e}\n")
                 print(f"   LLM出力の最初: {result_text[:200]}...\n")
 
@@ -1170,7 +1253,7 @@ class TermExtractor:
 
         except Exception as e:
             logger.error(f"Synonym detection with candidates failed: {e}")
-            print(f"⚠️  一般語との類義語判定でエラーが発生しました: {e}\n")
+            print(f"[WARN] 一般語との類義語判定でエラーが発生しました: {e}\n")
             return representative_terms
 
     def save_to_database(self, terms: List[Dict]) -> int:
@@ -1206,6 +1289,25 @@ class TermExtractor:
 
         logger.info(f"Saved {saved_count} terms to database")
         return saved_count
+
+    def _is_duplicate(self, headword: str, state: TermExtractionState) -> bool:
+        """既存候補/専門用語との重複チェック"""
+        if not headword:
+            return True
+
+        key = headword.lower().strip()
+
+        # 専門用語リストとの重複チェック
+        existing_terms = {t.get("headword", "").lower().strip() for t in state["technical_terms"]}
+        if key in existing_terms:
+            return True
+
+        # 候補リストとの重複チェック
+        existing_candidates = {c.get("headword", "").lower().strip() for c in state["candidates"]}
+        if key in existing_candidates:
+            return True
+
+        return False
 
     # ========== LangGraph Workflow Nodes ==========
 
@@ -1252,16 +1354,22 @@ class TermExtractor:
         print(f"\n[Stage 1] チャンクから候補抽出中 ({len(state['text_chunks'])}個のチャンク)...")
 
         all_candidates = []
-        chain = self.candidate_extraction_prompt | self.llm | self.json_parser
+        llm_for_stage1 = self._structured_llms.get("candidate", self.llm)
+        chain = self.candidate_extraction_prompt | llm_for_stage1 | self._to_text | self.json_parser
 
-        # 並列処理
-        tasks = []
-        for i, chunk in enumerate(state["text_chunks"]):
-            task = chain.ainvoke({
-                "text": chunk,
-                "format_instructions": self.json_parser.get_format_instructions()
-            })
-            tasks.append(task)
+        # 並列処理（パース失敗時はスキップ）
+        async def _run_chunk(i: int, chunk: str):
+            try:
+                return await chain.ainvoke({
+                    "text": chunk,
+                    "format_instructions": self.json_parser.get_format_instructions()
+                })
+            except Exception as e:
+                logger.error(f"Stage1 candidate parsing failed for chunk {i}: {e}")
+                print(f"[WARN] Stage1 chunk {i+1} のJSONパースに失敗しました。スキップします。")
+                return None
+
+        tasks = [_run_chunk(i, chunk) for i, chunk in enumerate(state["text_chunks"])]
 
         # プログレスバー付き実行
         results = []
@@ -1273,6 +1381,8 @@ class TermExtractor:
 
         # 結果を集約
         for result in results:
+            if result is None:
+                continue
             if hasattr(result, "terms"):
                 candidates = result.terms
             elif isinstance(result, dict):
@@ -1296,7 +1406,7 @@ class TermExtractor:
         # 重複除去
         state["candidates"] = self._merge_duplicates(all_candidates)
         logger.info(f"Stage 1 complete: {len(state['candidates'])} candidates")
-        print(f"✓ {len(state['candidates'])}個の候補を抽出しました\n")
+        print(f"[OK] {len(state['candidates'])}個の候補を抽出しました\n")
 
         # Stage 1結果を保存
         if state.get("output_dir"):
@@ -1304,7 +1414,7 @@ class TermExtractor:
             state["output_dir"].mkdir(parents=True, exist_ok=True)
             with open(stage1_file, "w", encoding="utf-8") as f:
                 json.dump({"candidates": state["candidates"]}, f, ensure_ascii=False, indent=2)
-            print(f"✓ Stage 1 結果を保存: {stage1_file}\n")
+            print(f"[OK] Stage 1 結果を保存: {stage1_file}\n")
 
         return state
 
@@ -1322,17 +1432,20 @@ class TermExtractor:
         state["previous_list_hash"] = None
 
         logger.info(f"Stage 2 complete: {len(technical_terms)} technical terms")
-        print(f"✓ {len(technical_terms)}個の専門用語を選別しました\n")
+        print(f"[OK] {len(technical_terms)}個の専門用語を選別しました\n")
 
         return state
 
     async def _node_stage25_self_reflection(self, state: TermExtractionState) -> TermExtractionState:
         """Stage 2.5a: 自己反省ノード"""
         from .prompts import get_self_reflection_prompt
+        from langchain_core.output_parsers import JsonOutputParser
         import random
 
-        logger.info(f"[Stage 2.5] Self-reflection (iteration {state['refinement_iteration']})...")
-        print(f"[Stage 2.5] 自己反省中 (反復 {state['refinement_iteration'] + 1}/{state['max_refinement_iterations']})...")
+        refinement_iteration = state.get('refinement_iteration', 0)
+        max_iterations = state.get('max_refinement_iterations', 3)
+        logger.info(f"[Stage 2.5] Self-reflection (iteration {refinement_iteration})...")
+        print(f"[Stage 2.5] 自己反省中 (反復 {refinement_iteration + 1}/{max_iterations})...")
 
         # 用語リストをランダムサンプリング（毎回異なる視点で評価）
         sample_size_terms = min(50, len(state["technical_terms"]))
@@ -1354,60 +1467,61 @@ class TermExtractor:
 
         # 前回の反省
         previous_reflection = "初回の反省"
-        if state["reflection_history"]:
-            prev = state["reflection_history"][-1]
+        reflection_history = state.get("reflection_history", [])
+        if reflection_history:
+            prev = reflection_history[-1]
             previous_reflection = f"前回の問題点: {', '.join(prev.get('issues_found', []))}\n前回のアクション: {', '.join(prev.get('suggested_actions', []))}"
 
-        # LLM実行
+        # JsonOutputParser使用（補正付き）
+        reflection_parser = self._build_fixing_parser(ReflectionResult)
         prompt = get_self_reflection_prompt()
-        chain = prompt | self.llm
+        chain = prompt | self.llm | self._to_text | reflection_parser
 
-        result = await chain.ainvoke({
-            "num_terms": len(state["technical_terms"]),
-            "terms_json": terms_json,
-            "num_candidates": len(state["candidates"]),
-            "candidates_sample": candidates_sample,
-            "previous_reflection": previous_reflection
-        })
-
-        # JSONパース
-        import re
-        content = result.content if hasattr(result, 'content') else str(result)
-        json_match = re.search(r'\{.*\}', content, re.DOTALL)
-
-        if json_match:
-            try:
-                reflection = json.loads(json_match.group(0))
-            except json.JSONDecodeError:
-                reflection = {
-                    "issues_found": [],
-                    "confidence_in_current_list": 0.5,
-                    "suggested_actions": [],
-                    "should_continue": True,
-                    "reasoning": "Parse failed"
-                }
-        else:
+        try:
+            reflection = await chain.ainvoke({
+                "num_terms": len(state["technical_terms"]),
+                "terms_json": terms_json,
+                "num_candidates": len(state["candidates"]),
+                "candidates_sample": candidates_sample,
+                "previous_reflection": previous_reflection
+            })
+        except Exception as e:
+            logger.error(f"Reflection parsing failed: {e}")
             reflection = {
                 "issues_found": [],
                 "confidence_in_current_list": 0.5,
                 "suggested_actions": [],
                 "should_continue": True,
-                "reasoning": "No JSON found"
+                "reasoning": f"Parse error: {e}",
+                "missing_terms": []
             }
 
+        # デバッグ: パース後のreflection構造を確認（特にmissing_terms）
+        if isinstance(reflection, dict) and reflection.get("missing_terms"):
+            logger.debug(f"Parsed reflection contains {len(reflection['missing_terms'])} missing terms")
+            for idx, mt in enumerate(reflection["missing_terms"][:3]):  # 最初の3個だけログ
+                logger.debug(f"  Missing term {idx}: {mt}")
+
         # 反省履歴に追加
+        if "reflection_history" not in state:
+            state["reflection_history"] = []
         state["reflection_history"].append(reflection)
 
         # 収束判定
         if reflection["confidence_in_current_list"] >= 0.9 and not reflection["should_continue"]:
             state["refinement_converged"] = True
-            logger.info("✓ Refinement converged (high confidence)")
-            print(f"✓ 収束しました（信頼度: {reflection['confidence_in_current_list']:.2f}）\n")
+            logger.info("[OK] Refinement converged (high confidence)")
+            print(f"[OK] 収束しました（信頼度: {reflection['confidence_in_current_list']:.2f}）\n")
         else:
-            logger.info(f"Confidence: {reflection['confidence_in_current_list']:.2f}, Issues: {len(reflection['issues_found'])}")
+            logger.info(f"Confidence: {reflection['confidence_in_current_list']:.2f}, Issues: {len(reflection['issues_found'])}, Missing: {len(reflection.get('missing_terms', []))}")
             print(f"  信頼度: {reflection['confidence_in_current_list']:.2f}")
             if reflection["issues_found"]:
                 print(f"  問題点: {len(reflection['issues_found'])}個検出")
+            if reflection.get("missing_terms"):
+                print(f"  漏れ用語: {len(reflection['missing_terms'])}個発見")
+                # 最初の3つの漏れ用語を表示
+                for mt in reflection["missing_terms"][:3]:
+                    print(f"    - {mt.get('term', 'unknown')}")
 
         return state
 
@@ -1416,64 +1530,131 @@ class TermExtractor:
         from .prompts import get_term_refinement_prompt
 
         reflection = state["reflection_history"][-1]
+        removed_count = 0
+        added_count = 0
 
-        if not reflection["suggested_actions"] or state["refinement_converged"]:
-            logger.info("[Stage 2.5] No actions needed, skipping refinement")
-            print(f"✓ 改善不要、次のステージへ\n")
-            return state
+        # 1. Remove処理（既存）
+        if reflection["suggested_actions"] and not state["refinement_converged"]:
+            logger.info("[Stage 2.5] Refining terms...")
+            print(f"[Stage 2.5] 改善アクション実行中...")
 
-        logger.info("[Stage 2.5] Refining terms...")
-        print(f"[Stage 2.5] 改善アクション実行中...")
+            # 用語リストをJSON化
+            terms_json = json.dumps(state["technical_terms"], ensure_ascii=False, indent=2)
 
-        # 用語リストをJSON化
-        terms_json = json.dumps(state["technical_terms"], ensure_ascii=False, indent=2)
+            # LLM実行
+            prompt = get_term_refinement_prompt()
+            chain = prompt | self.llm | self._to_text
 
-        # LLM実行
-        prompt = get_term_refinement_prompt()
-        chain = prompt | self.llm
+            result = await chain.ainvoke({
+                "issues": "\n".join(reflection["issues_found"]),
+                "actions": "\n".join(reflection["suggested_actions"]),
+                "terms_json": terms_json
+            })
 
-        result = await chain.ainvoke({
-            "issues": "\n".join(reflection["issues_found"]),
-            "actions": "\n".join(reflection["suggested_actions"]),
-            "terms_json": terms_json
-        })
+            # アクションパース
+            import re
+            # VLLMChatClientなどが返すSimpleAIMessageに対応
+            content = getattr(result, "content", None)
+            if content is None:
+                if hasattr(result, "strip"):
+                    content = result.strip()
+                else:
+                    content = str(result)
 
-        # アクションパース
-        import re
-        content = result.content if hasattr(result, 'content') else str(result)
-        json_match = re.search(r'\[.*\]', content, re.DOTALL)
+            json_match = re.search(r'\[.*\]', content, re.DOTALL)
 
-        if json_match:
-            try:
-                actions = json.loads(json_match.group(0))
-                removed_count = 0
+            if json_match:
+                try:
+                    actions = json.loads(json_match.group(0))
 
-                for action in actions:
-                    if action.get("action") == "remove":
-                        term_name = action["term"]
-                        term_obj = next((t for t in state["technical_terms"]
-                                       if t["headword"] == term_name), None)
-                        if term_obj:
-                            state["technical_terms"].remove(term_obj)
-                            state["rejected_terms"].append({
-                                **term_obj,
-                                "rejection_reason": action.get("reason", "不明"),
-                                "rejected_at_stage25": state["refinement_iteration"]
-                            })
-                            removed_count += 1
+                    for action in actions:
+                        if action.get("action") == "remove":
+                            term_name = action["term"]
+                            term_obj = next((t for t in state["technical_terms"]
+                                           if t["headword"] == term_name), None)
+                            if term_obj:
+                                state["technical_terms"].remove(term_obj)
+                                if "rejected_terms" not in state:
+                                    state["rejected_terms"] = []
+                                state["rejected_terms"].append({
+                                    **term_obj,
+                                    "rejection_reason": action.get("reason", "不明"),
+                                    "rejected_at_stage25": state.get("refinement_iteration", 0)
+                                })
+                                removed_count += 1
 
-                    elif action.get("action") == "investigate":
-                        # 簡易実装: investigateはkeepとして扱う（RAG検索は省略）
-                        pass
+                        elif action.get("action") == "investigate":
+                            # 簡易実装: investigateはkeepとして扱う（RAG検索は省略）
+                            pass
 
-                logger.info(f"Refinement: removed {removed_count} terms")
-                print(f"✓ {removed_count}個の用語を除外しました\n")
+                    logger.info(f"Refinement: removed {removed_count} terms")
+                    if removed_count > 0:
+                        print(f"[OK] {removed_count}個の用語を除外しました")
 
-            except json.JSONDecodeError as e:
-                logger.error(f"Failed to parse refinement actions: {e}")
-                print(f"⚠️  改善アクションのパースに失敗\n")
+                except json.JSONDecodeError as e:
+                    logger.error(f"Failed to parse refinement actions: {e}")
+                    print(f"[WARN] 改善アクションのパースに失敗")
 
-        state["refinement_iteration"] += 1
+        # 2. Missing追加処理（NEW）
+        missing_terms = reflection.get("missing_terms", [])
+        if missing_terms:
+            logger.info(f"[Stage 2.5] Processing {len(missing_terms)} missing terms...")
+            print(f"[Stage 2.5] 漏れ用語を追加中 ({len(missing_terms)}個)...")
+
+            # デバッグ: missing_termsの構造を確認
+            logger.debug(f"missing_terms structure: {type(missing_terms)}, first item: {missing_terms[0] if missing_terms else 'empty'}")
+
+            # missing → candidates形式に変換（JsonOutputParserは常にdictを返す）
+            new_candidates = []
+            for m in missing_terms:
+                # JsonOutputParserは常にdictを返すため、dict前提で処理
+                term_str = m.get("term", "")
+                hw = term_str.strip()
+                if not hw:
+                    continue
+
+                # 重複チェック
+                if self._is_duplicate(hw, state):
+                    logger.debug(f"Skipping duplicate missing term: {hw}")
+                    continue
+
+                # 候補形式に変換（シンプルにdict access）
+                new_candidates.append({
+                    "headword": hw,
+                    "brief_definition": m.get("evidence", ""),
+                    "domain": m.get("suggested_domain"),
+                    "confidence": 0.6,  # 提案なので低め
+                    "source": "stage25_missing"
+                })
+                logger.debug(f"Added missing term candidate: {hw} (evidence: {m.get('evidence', '')[:50]}...)")
+
+            if new_candidates:
+                logger.info(f"Filtered {len(new_candidates)} unique missing terms for Stage2 incremental filtering")
+
+                # 増分Stage2実行（全候補ではなく新規のみ）
+                selected = await self._filter_technical_terms(new_candidates)
+
+                # technical_termsにマージ
+                for term in selected:
+                    state["technical_terms"].append(term)
+                    logger.debug(f"Added term to technical_terms: {term.get('headword')}")
+
+                added_count = len(selected)
+                logger.info(f"Added {added_count} terms from missing candidates (out of {len(new_candidates)} candidates)")
+                if added_count > 0:
+                    print(f"[OK] {added_count}個の用語を追加しました（{len(new_candidates)}個の候補から選別）")
+
+        # 変化のサマリー
+        if removed_count == 0 and added_count == 0:
+            print(f"[OK] 変化なし、次のステージへ\n")
+        else:
+            print(f"  （削除: {removed_count}個、追加: {added_count}個）\n")
+
+        # 収束判定用にカウントを記録
+        state["last_removed_count"] = removed_count
+        state["last_added_count"] = added_count
+
+        state["refinement_iteration"] = state.get("refinement_iteration", 0) + 1
         return state
 
     def _should_continue_refinement(self, state: TermExtractionState) -> Literal["continue", "finish"]:
@@ -1484,7 +1665,9 @@ class TermExtractor:
             return "finish"
 
         # 最大反復回数チェック
-        if state["refinement_iteration"] >= state["max_refinement_iterations"]:
+        refinement_iteration = state.get("refinement_iteration", 0)
+        max_iterations = state.get("max_refinement_iterations", 3)
+        if refinement_iteration >= max_iterations:
             logger.info("Max refinement iterations reached")
             print(f"[Stage 2.5] 最大反復回数に達しました\n")
             return "finish"
@@ -1499,9 +1682,10 @@ class TermExtractor:
         state["previous_list_hash"] = current_hash
 
         # ガード2: 前回と同じ問題指摘なら強制終了
-        if len(state["reflection_history"]) >= 2:
-            last_issues = set(state["reflection_history"][-1].get("issues_found", []))
-            prev_issues = set(state["reflection_history"][-2].get("issues_found", []))
+        reflection_history = state.get("reflection_history", [])
+        if len(reflection_history) >= 2:
+            last_issues = set(reflection_history[-1].get("issues_found", []))
+            prev_issues = set(reflection_history[-2].get("issues_found", []))
             if last_issues and prev_issues:
                 overlap = len(last_issues & prev_issues) / max(len(last_issues), 1)
                 if overlap > 0.8:  # 80%重複
@@ -1509,9 +1693,27 @@ class TermExtractor:
                     print(f"[Stage 2.5] 問題指摘が重複（{overlap:.0%}） - 収束と判定\n")
                     return "finish"
 
-        # 反省履歴チェック
-        if state["reflection_history"]:
-            latest = state["reflection_history"][-1]
+        # ガード3: 追加も削除もなし → 収束（NEW）
+        if state.get("refinement_iteration", 0) > 0:
+            last_added = state.get("last_added_count", 0)
+            last_removed = state.get("last_removed_count", 0)
+
+            if last_added == 0 and last_removed == 0:
+                logger.info("No changes in last iteration - converged")
+                print(f"[Stage 2.5] 前回の反復で変化なし - 収束と判定\n")
+                return "finish"
+
+        # ガード4: missing_termsが空 かつ confidence高い → 収束（NEW）
+        if reflection_history:
+            latest = reflection_history[-1]
+            missing = latest.get("missing_terms", [])
+
+            if not missing and latest["confidence_in_current_list"] >= 0.85:
+                logger.info("No missing terms and high confidence - converged")
+                print(f"[Stage 2.5] 漏れなし & 高信頼度 - 収束と判定\n")
+                return "finish"
+
+            # 従来のconfidenceチェック
             if latest["confidence_in_current_list"] >= 0.9:
                 return "finish"
 
@@ -1525,7 +1727,7 @@ class TermExtractor:
         state["technical_terms"] = await self._generate_definitions_with_rag(state["technical_terms"])
 
         logger.info(f"Stage 3 complete: {len(state['technical_terms'])} definitions generated")
-        print(f"✓ 定義生成が完了しました\n")
+        print(f"[OK] 定義生成が完了しました\n")
 
         return state
 
@@ -1547,7 +1749,7 @@ class TermExtractor:
         state["technical_terms"] = representative_terms
 
         logger.info(f"Stage 4 complete: {len(state['technical_terms'])} representative terms")
-        print(f"✓ 類義語検出が完了しました\n")
+        print(f"[OK] 類義語検出が完了しました\n")
 
         return state
 
@@ -1569,11 +1771,27 @@ class TermExtractor:
             "max_refinement_iterations": getattr(self.config, 'max_refinement_iterations', 3),
             "refinement_converged": False,
             "reflection_history": [],
+            "previous_list_hash": None,
+            "last_added_count": 0,
+            "last_removed_count": 0,
             "output_dir": output_dir
         }
 
         # ワークフロー構築
         workflow = await self._build_workflow()
+
+        # グラフ可視化を保存
+        if output_dir:
+            try:
+                graph_image = workflow.get_graph().draw_mermaid_png()
+                graph_file = output_dir / "langgraph_workflow.png"
+                output_dir.mkdir(parents=True, exist_ok=True)
+                with open(graph_file, "wb") as f:
+                    f.write(graph_image)
+                logger.info(f"LangGraph workflow visualization saved to {graph_file}")
+                print(f"[OK] ワークフローグラフを保存: {graph_file}\n")
+            except Exception as e:
+                logger.warning(f"Failed to save workflow graph: {e}")
 
         # LangGraphワークフロー全体のトレース設定（1回のみ、無料枠節約）
         from langchain_core.runnables import RunnableConfig
@@ -1583,7 +1801,7 @@ class TermExtractor:
             metadata={
                 "num_chunks": len(chunks),
                 "max_refinement_iterations": initial_state["max_refinement_iterations"],
-                "workflow_version": "v2_with_reflection_loop"
+                "workflow_version": "v3_with_missing_addition_loop"
             }
         )
 
@@ -1595,16 +1813,19 @@ class TermExtractor:
             reflection_log = output_dir / "reflection_log.json"
             with open(reflection_log, "w", encoding="utf-8") as f:
                 json.dump({
-                    "reflections": final_state["reflection_history"],
-                    "iterations": final_state["refinement_iteration"],
-                    "converged": final_state["refinement_converged"],
-                    "final_term_count": len(final_state["technical_terms"]),
-                    "rejected_count": len(final_state["rejected_terms"])
+                    "reflections": final_state.get("reflection_history", []),
+                    "iterations": final_state.get("refinement_iteration", 0),
+                    "converged": final_state.get("refinement_converged", False),
+                    "final_term_count": len(final_state.get("technical_terms", [])),
+                    "rejected_count": len(final_state.get("rejected_terms", [])),
+                    "rejected_terms_detail": final_state.get("rejected_terms", []),
+                    "last_added_count": final_state.get("last_added_count", 0),
+                    "last_removed_count": final_state.get("last_removed_count", 0)
                 }, f, ensure_ascii=False, indent=2)
             logger.info(f"Reflection log saved to {reflection_log}")
-            print(f"✓ 反省ログを保存: {reflection_log}\n")
+            print(f"[OK] 反省ログを保存: {reflection_log}\n")
 
-        return final_state["technical_terms"]
+        return final_state.get("technical_terms", [])
 
 
 # ========== Utility Functions ==========
@@ -1644,3 +1865,162 @@ __all__ = [
     "TermExtractor",
     "run_extraction_pipeline"
 ]
+
+
+# ========== LangGraph CLI Export ==========
+# LangSmith Studio でデバッグするためのグラフエクスポート
+# 使い方: langgraph dev を実行してから
+# https://smith.langchain.com/studio/?baseUrl=http://127.0.0.1:2024 にアクセス
+
+async def _get_graph_for_cli():
+    """LangGraph CLI用のグラフ取得関数（遅延import対応）"""
+    import os
+    import sys
+    # 絶対インポートを使用
+    try:
+        from src.rag.config import Config
+    except ImportError:
+        # パスに追加してインポート
+        sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+        from src.rag.config import Config
+
+    # 基本的なimportのみ（OpenAI/Azureは大抵入ってる）
+    from langchain_openai import ChatOpenAI, AzureChatOpenAI
+
+    # 設定を取得
+    config = Config()
+    provider = (getattr(config, "llm_provider", "azure") or "azure").lower()
+    temperature = getattr(config, "llm_temperature", 0.0)
+    max_tokens = getattr(config, "max_tokens", None)
+
+    def _build_openai_llm():
+        model = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
+        api_key = config.openai_api_key or os.getenv("OPENAI_API_KEY") or "DUMMY"
+        return ChatOpenAI(model=model, temperature=temperature, api_key=api_key, max_tokens=max_tokens)
+
+    def _build_azure_llm():
+        api_key = config.azure_openai_api_key or os.getenv("AZURE_OPENAI_API_KEY") or "DUMMY"
+        endpoint = config.azure_openai_endpoint or os.getenv("AZURE_OPENAI_ENDPOINT") or "https://dummy"
+        deployment = (
+            config.azure_openai_chat_deployment_name
+            or os.getenv("AZURE_OPENAI_CHAT_DEPLOYMENT_NAME")
+            or "dummy"
+        )
+        api_version = config.azure_openai_api_version
+        return AzureChatOpenAI(
+            azure_deployment=deployment,
+            temperature=temperature,
+            api_key=api_key,
+            azure_endpoint=endpoint,
+            api_version=api_version,
+            max_tokens=max_tokens
+        )
+
+    def _build_gemini_llm():
+        # Gemini使用時のみimport
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        model = os.getenv("GEMINI_MODEL_NAME", "gemini-1.5-pro")
+        api_key = os.getenv("GEMINI_API_KEY") or getattr(config, "gemini_api_key", None) or "DUMMY"
+        return ChatGoogleGenerativeAI(model=model, temperature=temperature, google_api_key=api_key)
+
+    def _build_hf_llm():
+        # HuggingFace使用時のみimport
+        from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+        from langchain_huggingface import HuggingFacePipeline
+        model_id = getattr(config, "hf_model_id", None) or os.getenv("HF_MODEL_ID")
+        if not model_id:
+            raise ValueError("Hugging Face model ID is required for huggingface_local provider")
+        tokenizer = AutoTokenizer.from_pretrained(model_id)
+        model = AutoModelForCausalLM.from_pretrained(model_id)
+        pipe = pipeline("text-generation", model=model, tokenizer=tokenizer, max_new_tokens=512)
+        return HuggingFacePipeline(pipeline=pipe)
+
+    def _build_vllm_llm():
+        # VLLM使用時のみimport
+        from src.rag.vllm_client import VLLMChatClient
+        endpoint = getattr(config, "vllm_endpoint", None) or os.getenv("VLLM_ENDPOINT")
+        if not endpoint:
+            raise ValueError("VLLM endpoint is required for vllm provider")
+
+        vllm_temperature = getattr(config, "vllm_temperature", temperature)
+        vllm_top_p = getattr(config, "vllm_top_p", 0.7)
+        vllm_top_k = getattr(config, "vllm_top_k", 5)
+        vllm_min_p = getattr(config, "vllm_min_p", 0.0)
+        vllm_max_tokens = getattr(config, "vllm_max_tokens", max_tokens) or 4096
+        vllm_reasoning_effort = getattr(config, "vllm_reasoning_effort", "medium")
+        vllm_timeout = getattr(config, "vllm_timeout", 60)
+
+        return VLLMChatClient(
+            endpoint=endpoint,
+            temperature=vllm_temperature,
+            top_p=vllm_top_p,
+            top_k=vllm_top_k,
+            min_p=vllm_min_p,
+            max_tokens=vllm_max_tokens,
+            reasoning_effort=vllm_reasoning_effort,
+            timeout=vllm_timeout
+        )
+
+    try:
+        if provider == "openai":
+            llm = _build_openai_llm()
+        elif provider == "azure":
+            llm = _build_azure_llm()
+        elif provider == "gemini":
+            llm = _build_gemini_llm()
+        elif provider in {"huggingface_local", "huggingface"}:
+            llm = _build_hf_llm()
+        elif provider == "vllm":
+            llm = _build_vllm_llm()
+        else:
+            llm = _build_openai_llm()
+    except Exception as e:
+        logger.warning(f"LLM initialisation failed for provider '{provider}': {e} - falling back to OpenAI default")
+        llm = _build_openai_llm()
+
+    # TermExtractorインスタンスを作成
+    extractor = TermExtractor(
+        config=config,
+        llm=llm,
+        embeddings=None,
+        vector_store=None,
+        pg_url=None,
+        jargon_table_name="jargon_dictionary"
+    )
+
+    # 本物のワークフローを返す
+    return await extractor._build_workflow()
+
+
+# ===== LangGraph CLI export (本番用グラフ) =====
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+
+# スレッドプールエグゼキューターを作成（グローバル）
+_executor = ThreadPoolExecutor(max_workers=1)
+
+def make_graph(config=None):
+    """LangGraph CLIが呼ぶエントリーポイント
+
+    Args:
+        config: RunnableConfig（現時点では使用しない）
+
+    Returns:
+        CompiledStateGraph: コンパイル済みのワークフロー
+    """
+    # ASGIサーバー内でblocking callを避けるため、別スレッドで実行
+    future = _executor.submit(_run_in_thread)
+    return future.result()
+
+def _run_in_thread():
+    """別スレッドで非同期関数を実行"""
+    # 新しいイベントループを作成して実行
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(_get_graph_for_cli())
+    finally:
+        loop.close()
+
+# Deprecated: グローバル変数でのエクスポートは削除
+# LangGraph CLIは make_graph 関数を直接呼ぶようになりました

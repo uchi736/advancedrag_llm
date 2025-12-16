@@ -24,6 +24,8 @@ langchain-core==0.3.62
 langchain-openai==0.3.18
 langchain-huggingface==0.1.2
 langchain-text-splitters==0.3.8
+langgraph==0.2.55
+langgraph-cli[inmem]
 langsmith==0.3.42
 
 # OpenAI

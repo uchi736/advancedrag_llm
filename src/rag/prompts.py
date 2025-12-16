@@ -404,7 +404,11 @@ SELF_REFLECTION_SYSTEM_PROMPT = """あなたは専門用語抽出の品質管理
   "confidence_in_current_list": 0.0～1.0,
   "suggested_actions": ["具体的な改善アクション1", "アクション2", ...],
   "should_continue": true/false,
-  "reasoning": "判断の理由を詳しく説明"
+  "reasoning": "判断の理由を詳しく説明",
+  "missing_terms": [
+    {{"term": "用語名", "evidence": "候補に残っているが専門用語と思われる根拠", "suggested_domain": "分野"}},
+    ...
+  ]
 }}
 
 ## 収束判定の厳格化
@@ -413,13 +417,22 @@ SELF_REFLECTION_SYSTEM_PROMPT = """あなたは専門用語抽出の品質管理
 1. 前回の指摘（reflection_history）と今回の issues_found が80%以上重複している
 2. confidence_in_current_list >= 0.85
 3. new_issues が0件かつ resolved_issues が0件（改善が停滞）
+4. missing_terms が0件（漏れがない）
+
+## missing_terms の指摘基準
+
+候補リストを参照し、以下に該当する用語を missing_terms として指摘してください:
+- 専門性が高いと判断されるが、現在のリストに含まれていない用語
+- 定義や文脈から判断して、専門用語として扱うべき用語
+- **最大5個まで**（優先度の高いものから）
 
 注意:
 - 問題がなく品質が高ければ confidence: 0.9以上、should_continue: false を返す
 - 深刻な問題があれば具体的な改善アクションを提案
 - suggested_actions は具体的に（例: "「処理」「実施」などの汎用動詞を除外"）
 - 前回の反省履歴も考慮して、改善が進んでいるか評価
-- 前回と同じ問題を繰り返し指摘する場合は収束と判断する"""
+- 前回と同じ問題を繰り返し指摘する場合は収束と判断する
+- missing_terms は evidence（根拠）を必ず記載すること"""
 
 SELF_REFLECTION_USER_PROMPT = """現在の専門用語リスト（{num_terms}個）:
 {terms_json}

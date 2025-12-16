@@ -1,0 +1,8 @@
+{
+  "$schema": "https://langgra.ph/schema.json",
+  "dependencies": ["."],
+  "graphs": {
+    "term_extraction": "src.rag.term_extraction:make_graph"
+  },
+  "env": ".env"
+}

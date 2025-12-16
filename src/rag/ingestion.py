@@ -344,27 +344,51 @@ class IngestionHandler:
         coll_name = collection_name or self.config.collection_name
 
         try:
-            # Delete from vector store
-            if self.vector_store:
-                # Get all chunk IDs for this document in the specified collection
-                if self.engine:
-                    with self.engine.connect() as conn:
-                        result = conn.execute(
-                            text("SELECT chunk_id FROM document_chunks WHERE document_id = :doc_id AND collection_name = :coll_name"),
-                            {"doc_id": doc_id, "coll_name": coll_name}
-                        )
-                        chunk_ids = [row[0] for row in result]
+            if not self.engine:
+                return False, "Database engine not available."
 
-                        if chunk_ids:
-                            # Delete from vector store
-                            self.vector_store.delete(chunk_ids)
+            with self.engine.connect() as conn:
+                # 1) 取得: 対象ドキュメントのチャンクID
+                result = conn.execute(
+                    text(
+                        "SELECT chunk_id FROM document_chunks "
+                        "WHERE document_id = :doc_id AND collection_name = :coll_name"
+                    ),
+                    {"doc_id": doc_id, "coll_name": coll_name}
+                )
+                chunk_ids = [row[0] for row in result]
 
-                        # Delete from document_chunks table (only for this collection)
-                        conn.execute(
-                            text("DELETE FROM document_chunks WHERE document_id = :doc_id AND collection_name = :coll_name"),
-                            {"doc_id": doc_id, "coll_name": coll_name}
-                        )
-                        conn.commit()
+                # 2) ベクトルストアから削除（あれば）
+                if chunk_ids and self.vector_store:
+                    try:
+                        # PGVector.delete は ids を渡す
+                        self.vector_store.delete(ids=chunk_ids, collection_name=coll_name)
+                    except Exception as ve:
+                        # 失敗しても SQL 側を削除し、メッセージに残す
+                        warn = f"Vector store delete failed: {ve}"
+                        print(warn)
+
+                # 3) keyword検索テーブルから削除
+                conn.execute(
+                    text(
+                        "DELETE FROM document_chunks "
+                        "WHERE document_id = :doc_id AND collection_name = :coll_name"
+                    ),
+                    {"doc_id": doc_id, "coll_name": coll_name}
+                )
+
+                # 4) ベクトル埋め込みテーブルからも削除（メタデータ chunk_id ベース）
+                # langchain_pg_embedding.cmetadata に chunk_id が入っている前提
+                conn.execute(
+                    text(
+                        "DELETE FROM langchain_pg_embedding "
+                        "WHERE collection_id = (SELECT uuid FROM langchain_pg_collection WHERE name = :coll_name) "
+                        "AND (cmetadata ->> 'chunk_id') = ANY(:chunk_ids)"
+                    ),
+                    {"coll_name": coll_name, "chunk_ids": chunk_ids or []}
+                )
+
+                conn.commit()
 
             return True, f"Successfully deleted document: {doc_id} from collection: {coll_name}"
 

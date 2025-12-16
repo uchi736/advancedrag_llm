@@ -233,10 +233,38 @@ def render_dictionary_tab(rag_system):
                         output_path = Path(output_json)
                         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-                        with st.spinner("用語抽出中... (LLMベースの処理)"):
+                        # Stage 2.5可視化用のコンテナを準備
+                        stage25_placeholder = st.empty()
+
+                        def ui_callback(event_type, data):
+                            """Stage 2.5イベントをUIに表示"""
+                            if event_type == "stage25_reflection":
+                                with stage25_placeholder.container():
+                                    st.markdown(f"### 🤔 反復 {data['iteration']}/{data['max_iterations']} - 自己反省")
+                                    col1, col2, col3 = st.columns(3)
+                                    col1.metric("信頼度", f"{data['confidence']:.2f}")
+                                    col2.metric("問題点", f"{len(data['issues'])}個")
+                                    col3.metric("漏れ用語", f"{len(data['missing'])}個")
+
+                                    if data['issues']:
+                                        with st.expander("検出された問題", expanded=False):
+                                            for issue in data['issues'][:5]:  # 上位5件
+                                                st.markdown(f"- {issue}")
+
+                                    if data['missing']:
+                                        with st.expander("漏れ用語候補", expanded=False):
+                                            st.markdown(", ".join(data['missing'][:10]))  # 最大10件
+
+                            elif event_type == "stage25_action":
+                                with stage25_placeholder.container():
+                                    if data['removed'] > 0 or data['added'] > 0:
+                                        st.success(f"✅ 除外: {data['removed']}個、追加: {data['added']}個")
+
+                        with st.status("用語抽出中...", expanded=True) as status:
                             # Get latest rag_system from session state to ensure correct collection_name
                             current_rag = st.session_state.get("rag_system", rag_system)
-                            asyncio.run(current_rag.extract_terms(input_path, str(output_path)))
+                            asyncio.run(current_rag.extract_terms(input_path, str(output_path), ui_callback=ui_callback))
+                            status.update(label="✅ 抽出完了!", state="complete")
 
                         st.session_state['term_extraction_output'] = str(output_path)
                         st.success(f"✅ 用語辞書を生成しました → {output_path}")
@@ -256,10 +284,38 @@ def render_dictionary_tab(rag_system):
                         output_path = Path(output_json)
                         output_path.parent.mkdir(parents=True, exist_ok=True)
 
-                        with st.spinner("用語抽出中... (LLMベースの処理)"):
+                        # Stage 2.5可視化用のコンテナを準備
+                        stage25_placeholder = st.empty()
+
+                        def ui_callback(event_type, data):
+                            """Stage 2.5イベントをUIに表示"""
+                            if event_type == "stage25_reflection":
+                                with stage25_placeholder.container():
+                                    st.markdown(f"### 🤔 反復 {data['iteration']}/{data['max_iterations']} - 自己反省")
+                                    col1, col2, col3 = st.columns(3)
+                                    col1.metric("信頼度", f"{data['confidence']:.2f}")
+                                    col2.metric("問題点", f"{len(data['issues'])}個")
+                                    col3.metric("漏れ用語", f"{len(data['missing'])}個")
+
+                                    if data['issues']:
+                                        with st.expander("検出された問題", expanded=False):
+                                            for issue in data['issues'][:5]:  # 上位5件
+                                                st.markdown(f"- {issue}")
+
+                                    if data['missing']:
+                                        with st.expander("漏れ用語候補", expanded=False):
+                                            st.markdown(", ".join(data['missing'][:10]))  # 最大10件
+
+                            elif event_type == "stage25_action":
+                                with stage25_placeholder.container():
+                                    if data['removed'] > 0 or data['added'] > 0:
+                                        st.success(f"✅ 除外: {data['removed']}個、追加: {data['added']}個")
+
+                        with st.status("用語抽出中...", expanded=True) as status:
                             # Get latest rag_system from session state to ensure correct collection_name
                             current_rag = st.session_state.get("rag_system", rag_system)
-                            asyncio.run(current_rag.extract_terms(input_path, str(output_path)))
+                            asyncio.run(current_rag.extract_terms(input_path, str(output_path), ui_callback=ui_callback))
+                            status.update(label="✅ 抽出完了!", state="complete")
 
                         st.session_state['term_extraction_output'] = str(output_path)
                         st.success(f"✅ 用語辞書を生成しました → {output_path}")

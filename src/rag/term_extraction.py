@@ -27,7 +27,7 @@ from langchain_core.output_parsers import JsonOutputParser
 from langchain.output_parsers.fix import OutputFixingParser
 from langchain_core.exceptions import OutputParserException
 from langchain_core.documents import Document
-from pydantic import BaseModel, Field, RootModel
+from pydantic import BaseModel, Field
 import asyncio
 from tqdm import tqdm
 
@@ -84,18 +84,18 @@ class SynonymGroup(BaseModel):
     domain: Optional[str] = "一般"
 
 
-class SynonymGroupList(RootModel[List[SynonymGroup]]):
-    pass
-
-
 class SynonymMap(BaseModel):
     term: str
     synonyms: List[str] = Field(default_factory=list)
     domain: Optional[str] = None
 
 
-class SynonymMapList(RootModel[List[SynonymMap]]):
-    pass
+class SynonymGroupResponse(BaseModel):
+    groups: List[SynonymGroup] = Field(default_factory=list, description="類義語グループ一覧")
+
+
+class SynonymMapResponse(BaseModel):
+    items: List[SynonymMap] = Field(default_factory=list, description="代表語→類義語の対応一覧")
 
 
 # ========== LangGraph State ==========
@@ -396,8 +396,8 @@ class TermExtractor:
         self._init_prompts()
         # JSONパース補正付きパーサー（LLMが崩れたJSONを返す場合の保険）
         self.json_parser = self._build_fixing_parser(ExtractedTermList)
-        self.term_group_parser = self._build_fixing_parser(SynonymGroupList)
-        self.synonym_map_parser = self._build_fixing_parser(SynonymMapList)
+        self.term_group_parser = self._build_fixing_parser(SynonymGroupResponse)
+        self.synonym_map_parser = self._build_fixing_parser(SynonymMapResponse)
         # LangChainの出力がAIMessageになる場合に備えて、contentを取り出すユーティリティ
         from langchain_core.runnables import RunnableLambda
         self._to_text = RunnableLambda(lambda x: x.content if hasattr(x, "content") else x)
@@ -503,8 +503,8 @@ class TermExtractor:
 
         _try_bind("candidate", ExtractedTermList)
         _try_bind("filter", FilteredTermResult)
-        _try_bind("term_group", SynonymGroupList)
-        _try_bind("synonym_map", SynonymMapList)
+        _try_bind("term_group", SynonymGroupResponse)
+        _try_bind("synonym_map", SynonymMapResponse)
 
     async def extract_from_documents(self, file_paths: List[Path], output_dir: Optional[Path] = None) -> Dict[str, Any]:
         """複数の文書から専門用語を抽出"""
@@ -987,7 +987,7 @@ class TermExtractor:
                         # ハイブリッド検索（ベクトル + キーワード）または ベクトルのみ
                         if use_hybrid:
                             # ハイブリッド検索: ベクトル + FTS + RRF融合
-                            docs = await self.hybrid_retriever.aget_relevant_documents(headword)
+                            docs = await self.hybrid_retriever.ainvoke(headword)
                         else:
                             # フォールバック: ベクトル検索のみ
                             docs = self.vector_store.similarity_search(headword, k=5)
@@ -1044,7 +1044,7 @@ class TermExtractor:
                 headword = term.get("headword", "")
                 if headword:
                     if use_hybrid:
-                        docs = await self.hybrid_retriever.aget_relevant_documents(headword)
+                        docs = await self.hybrid_retriever.ainvoke(headword)
                     else:
                         docs = self.vector_store.similarity_search(headword, k=5)
 
@@ -1147,7 +1147,7 @@ class TermExtractor:
 
             try:
                 parsed = self.term_group_parser.parse(result_text)
-                groups = parsed.__root__ if hasattr(parsed, "__root__") else parsed
+                groups = getattr(parsed, "groups", []) or []
 
                 representative_terms = []
                 for group in groups:
@@ -1225,7 +1225,7 @@ class TermExtractor:
 
             try:
                 parsed = self.synonym_map_parser.parse(result_text)
-                syn_items = parsed.__root__ if hasattr(parsed, "__root__") else parsed
+                syn_items = getattr(parsed, "items", []) or []
 
                 for term in representative_terms:
                     headword = term.get("headword", "")
@@ -1523,6 +1523,20 @@ class TermExtractor:
                 for mt in reflection["missing_terms"][:3]:
                     print(f"    - {mt.get('term', 'unknown')}")
 
+        # UIコールバック呼び出し
+        if hasattr(self, 'ui_callback') and self.ui_callback:
+            try:
+                self.ui_callback("stage25_reflection", {
+                    "iteration": refinement_iteration + 1,
+                    "max_iterations": max_iterations,
+                    "confidence": reflection.get("confidence_in_current_list", 0.0),
+                    "issues": reflection.get("issues_found", []),
+                    "missing": [mt.get("term", "") for mt in reflection.get("missing_terms", [])],
+                    "reasoning": reflection.get("reasoning", "")
+                })
+            except Exception as e:
+                logger.warning(f"UI callback failed: {e}")
+
         return state
 
     async def _node_stage25_refine_terms(self, state: TermExtractionState) -> TermExtractionState:
@@ -1649,6 +1663,16 @@ class TermExtractor:
             print(f"[OK] 変化なし、次のステージへ\n")
         else:
             print(f"  （削除: {removed_count}個、追加: {added_count}個）\n")
+
+        # UIコールバック呼び出し
+        if hasattr(self, 'ui_callback') and self.ui_callback:
+            try:
+                self.ui_callback("stage25_action", {
+                    "removed": removed_count,
+                    "added": added_count
+                })
+            except Exception as e:
+                logger.warning(f"UI callback failed: {e}")
 
         # 収束判定用にカウントを記録
         state["last_removed_count"] = removed_count
@@ -1829,9 +1853,14 @@ class TermExtractor:
 
 
 # ========== Utility Functions ==========
-async def run_extraction_pipeline(input_dir: Path, output_json: Path, config, llm, embeddings, vector_store, pg_url, jargon_table_name, jargon_manager=None, collection_name="documents"):
-    """専門用語抽出パイプラインの実行"""
+async def run_extraction_pipeline(input_dir: Path, output_json: Path, config, llm, embeddings, vector_store, pg_url, jargon_table_name, jargon_manager=None, collection_name="documents", ui_callback=None):
+    """専門用語抽出パイプラインの実行
+
+    Args:
+        ui_callback: Optional callback function(event_type: str, data: dict) for UI updates
+    """
     extractor = TermExtractor(config, llm, embeddings, vector_store, pg_url, jargon_table_name, collection_name=collection_name)
+    extractor.ui_callback = ui_callback  # コールバックを設定
 
     # ファイルの検索
     supported_exts = ['.txt', '.md', '.pdf']

@@ -1041,11 +1041,14 @@ class RAGSystem:
 
             return result
 
-    async def extract_terms(self, input_dir: str | Path, output_json: str | Path) -> None:
+    async def extract_terms(self, input_dir: str | Path, output_json: str | Path, ui_callback=None) -> None:
         """Extract terms from documents.
 
         Note: Only the first sample of each stage will be traced to LangSmith
         to avoid excessive requests while still allowing validation of the pipeline.
+
+        Args:
+            ui_callback: Optional callback function(event_type: str, data: dict) for UI updates
         """
         from src.rag.term_extraction import run_extraction_pipeline
 
@@ -1056,7 +1059,8 @@ class RAGSystem:
             self.config, self.llm, self.embeddings,
             self.vector_store, pg_url, self.config.jargon_table_name,
             jargon_manager=None,
-            collection_name=self.config.collection_name
+            collection_name=self.config.collection_name,
+            ui_callback=ui_callback
         )
         print(f"[TermExtractor] Extraction complete -> {output_json}")
 

@@ -422,16 +422,41 @@ class RAGSystem:
             # Note: This table is created by LangChain PGVector, but without index
             # HNSW provides ~100x faster similarity search compared to sequential scan
             try:
-                conn.execute(text("""
-                    CREATE INDEX IF NOT EXISTS langchain_pg_embedding_hnsw_idx
-                    ON langchain_pg_embedding
-                    USING hnsw (embedding vector_cosine_ops)
-                    WITH (m = 16, ef_construction = 64)
+                # Check if table exists and has data
+                result = conn.execute(text("""
+                    SELECT EXISTS (
+                        SELECT 1 FROM information_schema.tables
+                        WHERE table_name = 'langchain_pg_embedding'
+                    )
                 """))
-                logger.info("HNSW index created/verified for langchain_pg_embedding")
+
+                if result.scalar():
+                    # Get embedding dimensions from existing data
+                    result = conn.execute(text("""
+                        SELECT vector_dims(embedding) as dims
+                        FROM langchain_pg_embedding
+                        LIMIT 1
+                    """))
+                    row = result.fetchone()
+
+                    if row and row[0]:
+                        dims = row[0]
+                        logger.info(f"Creating HNSW index with {dims} dimensions...")
+
+                        # Create HNSW index with explicit dimension
+                        conn.execute(text(f"""
+                            CREATE INDEX IF NOT EXISTS langchain_pg_embedding_hnsw_idx
+                            ON langchain_pg_embedding
+                            USING hnsw ((embedding::vector({dims})) vector_cosine_ops)
+                            WITH (m = 16, ef_construction = 64)
+                        """))
+                        logger.info(f"HNSW index created for {dims}-dimensional vectors")
+                    else:
+                        logger.info("No embeddings found yet, skipping HNSW index creation (will create on next startup)")
+                else:
+                    logger.info("langchain_pg_embedding table does not exist yet, skipping HNSW index creation")
             except Exception as e:
-                # Table might not exist yet (created on first document add)
-                logger.warning(f"Could not create HNSW index (table may not exist yet): {e}")
+                logger.warning(f"Could not create HNSW index: {e}")
 
             # スキーマ検証とマイグレーション
             self._validate_and_migrate_schema(conn)

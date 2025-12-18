@@ -36,9 +36,9 @@ LLMベースの専門用語抽出による辞書機能を実装したRAGA
   - `confidence`, `should_continue` で収束判定
 
 - **2.5b Refinement**: 反省に基づき用語リストを改善
-  - `remove`: 一般語を除外
+  - `remove`: 一般語を即座に除外
   - `keep`: 専門用語として保持
-  - `investigate`: RAG検索でコンテキスト調査（簡易実装では省略）
+  - `investigate`: RAG検索で定義を再生成 → 増分Stage2フィルタで再判定
 
 - **ループ制御**: 収束条件で自動終了
   - 信頼度 >= 0.9
@@ -107,14 +107,15 @@ sequenceDiagram
     Note over WF,LLM: Stage 2.5: 自己反省ループ
     loop 収束まで（最大3回）
         WF->>TE: _node_stage25_self_reflection
-        TE->>LLM: 用語リストを分析（ランダムサンプル50個）
-        LLM-->>TE: 問題点 + confidence + should_continue
+        TE->>LLM: 用語リストを全件バッチ処理で分析
+        LLM-->>TE: 問題点 + confidence + missing_terms
         TE-->>WF: state["reflection_history"] 追加
 
         WF->>TE: _node_stage25_refine_terms
         TE->>LLM: 問題に基づきアクション決定
         LLM-->>TE: remove/keep/investigate アクション
-        TE->>TE: 用語リスト更新
+        TE->>VS: investigate用語のRAG検索→再判定
+        TE->>TE: 用語リスト更新（削除・追加）
         TE-->>WF: state["technical_terms"] 更新
 
         WF->>WF: _should_continue_refinement
@@ -343,6 +344,46 @@ CREATE TABLE IF NOT EXISTS jargon_dictionary (
 
 -- ベクトルストア用テーブルはLangChainが自動作成します
 ```
+
+### データベーススキーマ
+
+#### langchain_pg_embedding（ベクトルストア）
+
+langchain-community 0.3.x 以降で必要なスキーマ：
+
+| カラム | 型 | 説明 |
+|--------|------|------|
+| uuid | UUID | 主キー（新スキーマ） |
+| id | VARCHAR | 旧主キー（nullable） |
+| collection_id | UUID | コレクション識別子 |
+| embedding | vector | 埋め込みベクトル |
+| document | VARCHAR | ドキュメント本文 |
+| cmetadata | JSONB | メタデータ |
+| custom_id | VARCHAR | カスタムID |
+| tokenized_content | TEXT | トークン化済みコンテンツ（FTS用） |
+
+```sql
+-- スキーマ確認
+SELECT column_name, data_type, is_nullable
+FROM information_schema.columns
+WHERE table_name = 'langchain_pg_embedding'
+ORDER BY ordinal_position;
+
+-- 手動でスキーマ修復が必要な場合
+ALTER TABLE langchain_pg_embedding ADD COLUMN IF NOT EXISTS custom_id VARCHAR;
+ALTER TABLE langchain_pg_embedding ADD COLUMN IF NOT EXISTS uuid UUID;
+-- 主キー変更（id → uuid）は _ensure_pgvector_schema() で自動実行
+```
+
+#### 自動スキーマ修復機能
+
+`RAGSystem` 初期化時に `_ensure_pgvector_schema()` が自動実行され、以下を修復：
+
+1. **カラム追加**: `custom_id`, `uuid` が存在しない場合は追加
+2. **主キー変更**: `id` → `uuid` への移行（langchain-community 0.3.x対応）
+3. **NOT NULL制約解除**: 旧 `id` カラムのNOT NULL制約を解除
+
+これにより、異なる環境間でのスキーマ互換性問題を自動的に解決します。
 
 ### 4. 環境変数の設定
 

@@ -123,6 +123,7 @@ class TermExtractionState(TypedDict):
     previous_list_hash: Optional[int]  # 前回のリストハッシュ（変更検知用）
     last_added_count: int  # 前回の追加数（収束判定用）
     last_removed_count: int  # 前回の削除数（収束判定用）
+    investigate_terms: Annotated[List[Dict], _overwrite_list]  # investigate対象用語（上書き）
 
     # 出力ディレクトリ
     output_dir: Optional[Path]
@@ -984,13 +985,15 @@ class TermExtractor:
 
                 for attempt in range(max_retries):
                     try:
-                        # ハイブリッド検索（ベクトル + キーワード）または ベクトルのみ
-                        if use_hybrid:
-                            # ハイブリッド検索: ベクトル + FTS + RRF融合
-                            docs = await self.hybrid_retriever.ainvoke(headword)
+                        # 定義生成用: フィルタなしでk*2件取得 → 手動でjargon_term除外 → k件
+                        docs = []
+                        if self.vector_store:
+                            all_docs = self.vector_store.similarity_search(headword, k=10)
+                            logger.info(f"[Stage3 RAG] '{headword}': similarity_search returned {len(all_docs)} docs")
+                            docs = [d for d in all_docs if d.metadata.get('type') != 'jargon_term'][:5]
+                            logger.info(f"[Stage3 RAG] '{headword}': after jargon filter = {len(docs)} docs")
                         else:
-                            # フォールバック: ベクトル検索のみ
-                            docs = self.vector_store.similarity_search(headword, k=5)
+                            logger.warning(f"[Stage3 RAG] '{headword}': vector_store is None!")
 
                         if docs:
                             # コンテキストを結合（最大3000文字）
@@ -1043,10 +1046,11 @@ class TermExtractor:
                 # Override chain.ainvoke to use config for this call only
                 headword = term.get("headword", "")
                 if headword:
-                    if use_hybrid:
-                        docs = await self.hybrid_retriever.ainvoke(headword)
-                    else:
-                        docs = self.vector_store.similarity_search(headword, k=5)
+                    # フィルタなしでk*2件取得 → 手動でjargon_term除外 → k件
+                    docs = []
+                    if self.vector_store:
+                        all_docs = self.vector_store.similarity_search(headword, k=10)
+                        docs = [d for d in all_docs if d.metadata.get('type') != 'jargon_term'][:5]
 
                     if docs:
                         context = "\n\n".join([doc.page_content for doc in docs])[:3000]
@@ -1228,7 +1232,12 @@ class TermExtractor:
 
             try:
                 parsed = self.synonym_map_parser.parse(result_text)
-                syn_items = getattr(parsed, "items", []) or []
+                if isinstance(parsed, dict):
+                    syn_items = parsed.get("items", []) or []
+                else:
+                    syn_items = getattr(parsed, "items", []) or []
+                if callable(syn_items):
+                    syn_items = []
 
                 for term in representative_terms:
                     headword = term.get("headword", "")
@@ -1270,19 +1279,25 @@ class TermExtractor:
         with self.engine.begin() as conn:
             for term in terms:
                 try:
+                    domain = term.get("domain")
+                    related_terms = term.get("related_terms", [])
                     conn.execute(
                         text(f"""
-                            INSERT INTO {self.jargon_table_name} (term, definition, aliases, collection_name)
-                            VALUES (:term, :definition, :aliases, :collection_name)
+                            INSERT INTO {self.jargon_table_name} (term, definition, domain, aliases, related_terms, collection_name)
+                            VALUES (:term, :definition, :domain, :aliases, :related_terms, :collection_name)
                             ON CONFLICT (term, collection_name) DO UPDATE
                             SET definition = EXCLUDED.definition,
+                                domain = EXCLUDED.domain,
                                 aliases = EXCLUDED.aliases,
+                                related_terms = EXCLUDED.related_terms,
                                 updated_at = CURRENT_TIMESTAMP
                         """),
                         {
                             "term": term.get("headword"),
                             "definition": term.get("definition", ""),
+                            "domain": domain,
                             "aliases": term.get("synonyms", []),
+                            "related_terms": related_terms,
                             "collection_name": self.collection_name
                         }
                     )
@@ -1294,7 +1309,7 @@ class TermExtractor:
         return saved_count
 
     def _is_duplicate(self, headword: str, state: TermExtractionState) -> bool:
-        """既存候補/専門用語との重複チェック"""
+        """既存候補/専門用語/除外済み用語との重複チェック"""
         if not headword:
             return True
 
@@ -1308,6 +1323,12 @@ class TermExtractor:
         # 候補リストとの重複チェック
         existing_candidates = {c.get("headword", "").lower().strip() for c in state["candidates"]}
         if key in existing_candidates:
+            return True
+
+        # rejected_termsとの重複チェック（Stage2.5で一度却下された用語を再度拾わない）
+        rejected = state.get("rejected_terms", [])
+        rejected_keys = {r.get("headword", "").lower().strip() for r in rejected}
+        if key in rejected_keys:
             return True
 
         return False
@@ -1440,33 +1461,21 @@ class TermExtractor:
         return state
 
     async def _node_stage25_self_reflection(self, state: TermExtractionState) -> TermExtractionState:
-        """Stage 2.5a: 自己反省ノード"""
+        """Stage 2.5a: 自己反省ノード（バッチ処理版）"""
         from .prompts import get_self_reflection_prompt
         from langchain_core.output_parsers import JsonOutputParser
-        import random
 
         refinement_iteration = state.get('refinement_iteration', 0)
         max_iterations = state.get('max_refinement_iterations', 3)
         logger.info(f"[Stage 2.5] Self-reflection (iteration {refinement_iteration})...")
         print(f"[Stage 2.5] 自己反省中 (反復 {refinement_iteration + 1}/{max_iterations})...")
 
-        # 用語リストをランダムサンプリング（毎回異なる視点で評価）
-        sample_size_terms = min(50, len(state["technical_terms"]))
-        sample_terms = random.sample(state["technical_terms"], sample_size_terms) if sample_size_terms > 0 else []
-        terms_json = json.dumps(
-            sample_terms,
-            ensure_ascii=False,
-            indent=2
-        )
+        # バッチサイズ設定（configから取得、デフォルト100）
+        batch_size_terms = getattr(self.config, 'reflection_batch_size_terms', 100)
+        batch_size_candidates = getattr(self.config, 'reflection_batch_size_candidates', 50)
 
-        # 候補のランダムサンプル
-        sample_size_candidates = min(20, len(state["candidates"]))
-        sample_candidates = random.sample(state["candidates"], sample_size_candidates) if sample_size_candidates > 0 else []
-        candidates_sample = json.dumps(
-            sample_candidates,
-            ensure_ascii=False,
-            indent=2
-        )
+        technical_terms = state["technical_terms"]
+        candidates = state["candidates"]
 
         # 前回の反省
         previous_reflection = "初回の反省"
@@ -1475,29 +1484,100 @@ class TermExtractor:
             prev = reflection_history[-1]
             previous_reflection = f"前回の問題点: {', '.join(prev.get('issues_found', []))}\n前回のアクション: {', '.join(prev.get('suggested_actions', []))}"
 
+        # バッチ分割
+        term_batches = [technical_terms[i:i + batch_size_terms]
+                       for i in range(0, len(technical_terms), batch_size_terms)] or [[]]
+        candidate_batches = [candidates[i:i + batch_size_candidates]
+                           for i in range(0, len(candidates), batch_size_candidates)] or [[]]
+
+        num_batches = max(len(term_batches), len(candidate_batches))
+        logger.info(f"Processing {len(technical_terms)} terms and {len(candidates)} candidates in {num_batches} batch(es)")
+        if num_batches > 1:
+            print(f"  （{num_batches}バッチに分割して処理）")
+
         # JsonOutputParser使用（補正付き）
         reflection_parser = self._build_fixing_parser(ReflectionResult)
         prompt = get_self_reflection_prompt()
         chain = prompt | self.llm | self._to_text | reflection_parser
 
-        try:
-            reflection = await chain.ainvoke({
-                "num_terms": len(state["technical_terms"]),
-                "terms_json": terms_json,
-                "num_candidates": len(state["candidates"]),
-                "candidates_sample": candidates_sample,
-                "previous_reflection": previous_reflection
-            })
-        except Exception as e:
-            logger.error(f"Reflection parsing failed: {e}")
-            reflection = {
-                "issues_found": [],
-                "confidence_in_current_list": 0.5,
-                "suggested_actions": [],
-                "should_continue": True,
-                "reasoning": f"Parse error: {e}",
-                "missing_terms": []
-            }
+        # バッチ処理結果を集約
+        all_issues: List[str] = []
+        all_actions: List[str] = []
+        all_missing: List[Dict] = []
+        confidence_scores: List[float] = []
+        all_reasonings: List[str] = []
+
+        for batch_idx in range(num_batches):
+            # 各バッチのデータを取得（インデックスがはみ出る場合は空リスト）
+            term_batch = term_batches[batch_idx] if batch_idx < len(term_batches) else []
+            candidate_batch = candidate_batches[batch_idx] if batch_idx < len(candidate_batches) else []
+
+            if not term_batch and not candidate_batch:
+                continue
+
+            terms_json = json.dumps(term_batch, ensure_ascii=False, indent=2)
+            candidates_sample = json.dumps(candidate_batch, ensure_ascii=False, indent=2)
+
+            # 却下済み用語リストを作成（LLMが同じ用語を繰り返し指摘しないように）
+            rejected_terms = state.get("rejected_terms", [])
+            rejected_headwords = [r.get("headword", "") for r in rejected_terms if r.get("headword")]
+            rejected_terms_list = ", ".join(rejected_headwords[:50]) if rejected_headwords else "（なし）"
+            if rejected_headwords:
+                logger.debug(f"Passing {len(rejected_headwords)} rejected terms to LLM: {rejected_headwords[:5]}...")
+
+            try:
+                batch_reflection = await chain.ainvoke({
+                    "num_terms": len(technical_terms),
+                    "terms_json": terms_json,
+                    "num_candidates": len(candidates),
+                    "candidates_sample": candidates_sample,
+                    "rejected_terms_list": rejected_terms_list,
+                    "previous_reflection": previous_reflection
+                })
+
+                # 結果を集約
+                all_issues.extend(batch_reflection.get("issues_found", []))
+                all_actions.extend(batch_reflection.get("suggested_actions", []))
+                all_missing.extend(batch_reflection.get("missing_terms", []))
+                confidence_scores.append(batch_reflection.get("confidence_in_current_list", 0.5))
+                all_reasonings.append(batch_reflection.get("reasoning", ""))
+
+                logger.debug(f"Batch {batch_idx + 1}/{num_batches}: "
+                           f"issues={len(batch_reflection.get('issues_found', []))}, "
+                           f"missing={len(batch_reflection.get('missing_terms', []))}")
+
+            except Exception as e:
+                logger.error(f"Reflection parsing failed for batch {batch_idx + 1}: {e}")
+                continue
+
+        # 結果を統合（重複排除）
+        unique_issues = list(dict.fromkeys(all_issues))  # 順序保持で重複排除
+        unique_actions = list(dict.fromkeys(all_actions))
+        # missing_termsはtermで重複排除
+        seen_terms = set()
+        unique_missing = []
+        for m in all_missing:
+            term = m.get("term", "")
+            if term and term not in seen_terms:
+                seen_terms.add(term)
+                unique_missing.append(m)
+
+        # 最終的なreflection結果
+        avg_confidence = sum(confidence_scores) / len(confidence_scores) if confidence_scores else 0.5
+        should_continue = avg_confidence < 0.9 or len(unique_issues) > 0 or len(unique_missing) > 0
+
+        reflection = {
+            "issues_found": unique_issues,
+            "confidence_in_current_list": avg_confidence,
+            "suggested_actions": unique_actions,
+            "should_continue": should_continue,
+            "reasoning": " | ".join(all_reasonings) if all_reasonings else "バッチ処理完了",
+            "missing_terms": unique_missing[:10]  # 最大10個に制限
+        }
+
+        logger.info(f"Aggregated reflection: issues={len(unique_issues)}, "
+                   f"actions={len(unique_actions)}, missing={len(unique_missing)}, "
+                   f"avg_confidence={avg_confidence:.2f}")
 
         # デバッグ: パース後のreflection構造を確認（特にmissing_terms）
         if isinstance(reflection, dict) and reflection.get("missing_terms"):
@@ -1551,8 +1631,9 @@ class TermExtractor:
                     "issues": reflection.get("issues_found", []),
                     "suggested_actions": reflection.get("suggested_actions", []),
                     "missing_terms": reflection.get("missing_terms", []),
-                    "terms_sample_size": len(json.loads(terms_json)) if terms_json else 0,
-                    "candidates_sample_size": len(json.loads(candidates_sample)) if candidates_sample else 0
+                    "terms_count": len(technical_terms),  # 全件数
+                    "candidates_count": len(candidates),  # 全件数
+                    "num_batches": num_batches
                 }
                 snap_file = state["output_dir"] / f"stage25_reflection_iter{iter_idx}.json"
                 with open(snap_file, "w", encoding="utf-8") as f:
@@ -1572,8 +1653,13 @@ class TermExtractor:
             "terms": len(state.get("technical_terms", [])),
             "rejected": len(state.get("rejected_terms", []))
         }
-        removed_count = 0
-        added_count = 0
+
+        # 各処理の結果を追跡
+        direct_removed_count = 0  # Remove処理での削除数
+        added_count = 0           # Missing処理での追加数
+        missing_rejected_count = 0  # Missing処理での却下数
+        investigated_kept = 0     # Investigate処理での保持数
+        investigated_removed = 0  # Investigate処理での除外数
 
         # 1. Remove処理（既存）
         if reflection["suggested_actions"] and not state["refinement_converged"]:
@@ -1623,15 +1709,24 @@ class TermExtractor:
                                     "rejection_reason": action.get("reason", "不明"),
                                     "rejected_at_stage25": state.get("refinement_iteration", 0)
                                 })
-                                removed_count += 1
+                                direct_removed_count += 1
 
                         elif action.get("action") == "investigate":
-                            # 簡易実装: investigateはkeepとして扱う（RAG検索は省略）
-                            pass
+                            # investigate対象を収集（後でまとめてRAG再判定）
+                            term_name = action["term"]
+                            term_obj = next((t for t in state["technical_terms"]
+                                           if t["headword"] == term_name), None)
+                            if term_obj:
+                                if "investigate_terms" not in state:
+                                    state["investigate_terms"] = []
+                                state["investigate_terms"].append({
+                                    **term_obj,
+                                    "investigate_reason": action.get("reason", "専門性が不明")
+                                })
 
-                    logger.info(f"Refinement: removed {removed_count} terms")
-                    if removed_count > 0:
-                        print(f"[OK] {removed_count}個の用語を除外しました")
+                    logger.info(f"Refinement: removed {direct_removed_count} terms")
+                    if direct_removed_count > 0:
+                        print(f"  Remove: {direct_removed_count}個除外")
 
                 except json.JSONDecodeError as e:
                     logger.error(f"Failed to parse refinement actions: {e}")
@@ -1665,15 +1760,13 @@ class TermExtractor:
                     logger.debug(f"Skipping duplicate missing term: {hw}")
                     continue
 
-                # ★ RAG検索で定義生成
+                # ★ RAG検索で定義生成（フィルタなしで取得→手動除外）
                 definition = m.get("evidence", "")  # デフォルトはevidenceを使用
                 try:
-                    if use_hybrid:
-                        docs = await self.hybrid_retriever.ainvoke(hw)
-                    elif self.vector_store:
-                        docs = self.vector_store.similarity_search(hw, k=3)
-                    else:
-                        docs = []
+                    docs = []
+                    if self.vector_store:
+                        all_docs = self.vector_store.similarity_search(hw, k=6)
+                        docs = [d for d in all_docs if d.metadata.get('type') != 'jargon_term'][:3]
 
                     if docs:
                         # 上位3件の文書から定義生成
@@ -1699,38 +1792,137 @@ class TermExtractor:
             if new_candidates:
                 logger.info(f"Filtered {len(new_candidates)} unique missing terms for Stage2 incremental filtering")
 
+                # デバッグ: Stage2に渡す候補のbrief_definitionを確認
+                for c in new_candidates:
+                    logger.info(f"[Stage2.5 Input] {c.get('headword')}: brief_definition='{c.get('brief_definition', '')[:80]}...'")
+                    print(f"  → Stage2判定: {c.get('headword')} | 定義: {c.get('brief_definition', '')[:60]}...")
+
                 # 増分Stage2実行（全候補ではなく新規のみ）
                 selected = await self._filter_technical_terms(new_candidates)
+                if not selected:
+                    logger.warning("Stage2 incremental filtering returned 0 terms (all rejected or parse failure).")
+                    print(f"[WARN] Stage2 増分フィルタで追加0件（除外またはパース失敗の可能性）")
 
-                # technical_termsにマージ
+                # 選択されたものをtechnical_termsにマージ
+                selected_headwords = {t.get("headword") for t in selected}
                 for term in selected:
                     state["technical_terms"].append(term)
                     logger.debug(f"Added term to technical_terms: {term.get('headword')}")
 
+                # 却下されたものをrejected_termsに追加（次の反復で再度拾わないように）
+                for cand in new_candidates:
+                    if cand["headword"] not in selected_headwords:
+                        if "rejected_terms" not in state:
+                            state["rejected_terms"] = []
+                        state["rejected_terms"].append({
+                            **cand,
+                            "rejection_reason": "Stage2.5 missing_terms増分フィルタで除外",
+                            "rejected_at_stage25": refinement_iteration
+                        })
+                        logger.debug(f"Rejected missing term: {cand['headword']}")
+
                 added_count = len(selected)
-                logger.info(f"Added {added_count} terms from missing candidates (out of {len(new_candidates)} candidates)")
-                if added_count > 0:
-                    print(f"[OK] {added_count}個の用語を追加しました（{len(new_candidates)}個の候補から選別）")
+                missing_rejected_count = len(new_candidates) - added_count
+                logger.info(f"Added {added_count} terms from missing candidates (rejected {missing_rejected_count})")
+                print(f"  Missing: {added_count}個追加（{len(new_candidates)}個中{missing_rejected_count}個却下）")
+
+        # 3. Investigate処理（RAG再定義 → 増分Stage2フィルタで再判定）
+        investigate_terms = state.get("investigate_terms", [])
+        if investigate_terms:
+            logger.info(f"[Stage 2.5] Re-evaluating {len(investigate_terms)} investigate terms with RAG...")
+            print(f"[Stage 2.5] 疑わしい用語を再評価中 ({len(investigate_terms)}個、RAG再定義)...")
+
+            # ハイブリッド検索が使用可能かチェック
+            use_hybrid = self.hybrid_retriever is not None
+
+            # investigate → 一旦technical_termsから除外 → RAG定義生成 → 増分フィルタ
+            investigate_candidates = []
+            for inv_term in investigate_terms:
+                hw = inv_term.get("headword", "").strip()
+                if not hw:
+                    continue
+
+                # technical_termsから一旦除外
+                term_obj = next((t for t in state["technical_terms"]
+                               if t["headword"] == hw), None)
+                if term_obj:
+                    state["technical_terms"].remove(term_obj)
+
+                # RAG検索で定義を再生成（フィルタなしで取得→手動除外）
+                definition = inv_term.get("brief_definition", "")
+                try:
+                    docs = []
+                    if self.vector_store:
+                        all_docs = self.vector_store.similarity_search(hw, k=6)
+                        docs = [d for d in all_docs if d.metadata.get('type') != 'jargon_term'][:3]
+
+                    if docs:
+                        context = "\n".join([d.page_content[:500] for d in docs[:3]])
+                        definition = await self._generate_definition_for_missing_term(hw, context)
+                        logger.debug(f"Re-generated RAG definition for investigate term '{hw}': {definition[:50]}...")
+                except Exception as e:
+                    logger.warning(f"RAG definition re-generation failed for '{hw}': {e}")
+
+                investigate_candidates.append({
+                    "headword": hw,
+                    "brief_definition": definition,
+                    "domain": inv_term.get("domain"),
+                    "confidence": 0.5,  # 再評価なので低めに設定
+                    "source": "stage25_investigate_reevaluated",
+                    "original_reason": inv_term.get("investigate_reason", "")
+                })
+
+            if investigate_candidates:
+                # 増分Stage2フィルタで再判定
+                revalidated = await self._filter_technical_terms(investigate_candidates)
+
+                # 通ったものはtechnical_termsに戻す
+                revalidated_headwords = {t.get("headword") for t in revalidated}
+                for term in revalidated:
+                    state["technical_terms"].append(term)
+                    investigated_kept += 1
+                    logger.debug(f"Investigate term kept: {term.get('headword')}")
+
+                # 通らなかったものはrejected_termsへ
+                for inv_cand in investigate_candidates:
+                    if inv_cand["headword"] not in revalidated_headwords:
+                        if "rejected_terms" not in state:
+                            state["rejected_terms"] = []
+                        state["rejected_terms"].append({
+                            **inv_cand,
+                            "rejection_reason": f"Stage2.5 investigate再評価で除外: {inv_cand.get('original_reason', '')}",
+                            "rejected_at_stage25": refinement_iteration
+                        })
+                        investigated_removed += 1
+                        logger.debug(f"Investigate term rejected: {inv_cand['headword']}")
+
+                logger.info(f"Investigate re-evaluation: {investigated_kept} kept, {investigated_removed} removed")
+                print(f"  Investigate: {investigated_kept}個保持、{investigated_removed}個除外")
+
+            # investigate_termsをクリア
+            state["investigate_terms"] = []
 
         # 変化のサマリー
-        if removed_count == 0 and added_count == 0:
-            print(f"[OK] 変化なし、次のステージへ\n")
+        total_removed = direct_removed_count + investigated_removed
+        total_added = added_count
+        if total_removed == 0 and total_added == 0:
+            print(f"[Stage 2.5] 変化なし\n")
         else:
-            print(f"  （削除: {removed_count}個、追加: {added_count}個）\n")
+            print(f"[Stage 2.5] → 合計: 削除{total_removed}個、追加{total_added}個\n")
 
         # UIコールバック呼び出し
         if hasattr(self, 'ui_callback') and self.ui_callback:
             try:
                 self.ui_callback("stage25_action", {
-                    "removed": removed_count,
-                    "added": added_count
+                    "removed": total_removed,
+                    "added": total_added
                 })
             except Exception as e:
                 logger.warning(f"UI callback failed: {e}")
 
         # 収束判定用にカウントを記録
-        state["last_removed_count"] = removed_count
-        state["last_added_count"] = added_count
+        state["last_removed_count"] = total_removed
+        state["last_added_count"] = total_added
 
         if state.get("output_dir"):
             try:
@@ -1741,8 +1933,13 @@ class TermExtractor:
                 }
                 snapshot = {
                     "iteration": iter_idx,
-                    "removed_count": removed_count,
-                    "added_count": added_count,
+                    "direct_removed_count": direct_removed_count,
+                    "missing_added_count": added_count,
+                    "missing_rejected_count": missing_rejected_count,
+                    "investigated_kept": investigated_kept,
+                    "investigated_removed": investigated_removed,
+                    "total_removed": total_removed,
+                    "total_added": total_added,
                     "suggested_actions": reflection.get("suggested_actions", []),
                     "missing_terms": missing_terms,
                     "before_counts": before_counts,
@@ -1904,6 +2101,7 @@ class TermExtractor:
             "previous_list_hash": None,
             "last_added_count": 0,
             "last_removed_count": 0,
+            "investigate_terms": [],
             "output_dir": output_dir
         }
 

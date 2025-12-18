@@ -219,6 +219,11 @@ TECHNICAL_TERM_FILTER_SYSTEM_PROMPT = """抽出された候補から、本当に
 **重要**: brief_definitionの内容を考慮せずに用語名だけで判断しないでください！
 例えば「学習」は一般語に見えますが、brief_definitionが「機械学習アルゴリズムの訓練プロセス」であれば専門用語として扱うべきです。
 
+**必須要件（欠落禁止）**:
+- 入力されたすべての候補を必ず分類し、1つの候補につき1回だけ selected または rejected のどちらかに含めること（抜け・重複は禁止）
+- 判定に迷うものは rejected として rejection_reason を付与すること
+- selected の件数 + rejected の件数 = 入力候補の件数 になること
+
 出力形式:
 {format_instructions}
 
@@ -425,6 +430,7 @@ SELF_REFLECTION_SYSTEM_PROMPT = """あなたは専門用語抽出の品質管理
 - 専門性が高いと判断されるが、現在のリストに含まれていない用語
 - 定義や文脈から判断して、専門用語として扱うべき用語
 - **最大5個まで**（優先度の高いものから）
+- **重要**: 「既に却下済みの用語」に含まれる用語は絶対に指摘しないこと
 
 注意:
 - 問題がなく品質が高ければ confidence: 0.9以上、should_continue: false を返す
@@ -432,7 +438,8 @@ SELF_REFLECTION_SYSTEM_PROMPT = """あなたは専門用語抽出の品質管理
 - suggested_actions は具体的に（例: "「処理」「実施」などの汎用動詞を除外"）
 - 前回の反省履歴も考慮して、改善が進んでいるか評価
 - 前回と同じ問題を繰り返し指摘する場合は収束と判断する
-- missing_terms は evidence（根拠）を必ず記載すること"""
+- missing_terms は evidence（根拠）を必ず記載すること
+- 「既に却下済みの用語」は過去のフィルタで除外された用語なので、再度指摘しても無駄"""
 
 SELF_REFLECTION_USER_PROMPT = """現在の専門用語リスト（{num_terms}個）:
 {terms_json}
@@ -440,12 +447,16 @@ SELF_REFLECTION_USER_PROMPT = """現在の専門用語リスト（{num_terms}個
 候補リスト（参考）（{num_candidates}個の候補から選別済み）:
 {candidates_sample}
 
+既に却下済みの用語（これらは絶対にmissing_termsに含めないこと）:
+{rejected_terms_list}
+
 前回の反省（前回何を改善したか）:
 {previous_reflection}
 
 ---
 
-上記を分析し、JSON形式で評価してください。"""
+上記を分析し、JSON形式で評価してください。
+※「既に却下済みの用語」に含まれる用語は、過去に検討済みで除外されたものです。これらを再度missing_termsとして指摘しないでください。"""
 
 TERM_REFINEMENT_SYSTEM_PROMPT = """前回の反省で指摘された問題点に基づき、各専門用語について適切なアクションを決定してください。
 

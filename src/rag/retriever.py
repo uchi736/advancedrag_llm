@@ -1,4 +1,5 @@
 import json
+import re
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from typing import List, Dict, Any, Optional, Tuple
@@ -35,30 +36,20 @@ class JapaneseHybridRetriever(BaseRetriever):
         if not self.vector_store:
             return []
         try:
-            # Fetch more results than needed to account for jargon term filtering
-            search_k = self.config_params.vector_search_k * 2
+            search_k = self.config_params.vector_search_k
 
-            # Check if it's an adapter or native vector store
+            # フィルタなしでk*2件取得 → 手動でjargon_term除外 → k件
+            # (メタデータフィルタはtype未設定のドキュメントも除外してしまうため使わない)
             if hasattr(self.vector_store, 'similarity_search_with_score'):
-                results = self.vector_store.similarity_search_with_score(q, k=search_k)
+                results = self.vector_store.similarity_search_with_score(q, k=search_k * 2)
             elif hasattr(self.vector_store, 'vector_store'):
-                # It's wrapped in an adapter
-                results = self.vector_store.vector_store.similarity_search_with_score(q, k=search_k)
+                results = self.vector_store.vector_store.similarity_search_with_score(q, k=search_k * 2)
             else:
                 return []
 
-            # Filter out jargon terms (type='jargon_term') from document search
-            # This ensures only document chunks are returned, not jargon definitions
-            filtered_results = []
-            for doc, score in results:
-                if doc.metadata.get('type') != 'jargon_term':
-                    filtered_results.append((doc, score))
-
-                # Stop when we have enough results
-                if len(filtered_results) >= self.config_params.vector_search_k:
-                    break
-
-            return filtered_results[:self.config_params.vector_search_k]
+            # 手動でjargon_termを除外
+            filtered = [(doc, score) for doc, score in results if doc.metadata.get('type') != 'jargon_term']
+            return filtered[:search_k]
 
         except Exception as exc:
             print(f"[HybridRetriever] vector search error: {exc}")
@@ -88,15 +79,25 @@ class JapaneseHybridRetriever(BaseRetriever):
                     filtered_tokens = [t for t in tokens[:5] if len(t) >= self.config_params.japanese_min_token_length]
                     if not filtered_tokens: return []
 
-                    # Create tsquery format: "token1 | token2 | token3" (OR search for better recall)
-                    tsquery_str = " | ".join(filtered_tokens)
+                    # 記号を空白にして安全なクエリにする
+                    safe_tokens = []
+                    for t in filtered_tokens:
+                        cleaned = re.sub(r"[^\\wぁ-んァ-ヶ一-龠ー\\s]", " ", t)
+                        cleaned = cleaned.strip()
+                        if cleaned:
+                            safe_tokens.append(cleaned)
 
-                    # Use PostgreSQL Full-Text Search with GIN index on tokenized_content
+                    if not safe_tokens:
+                        return []
+
+                    # plainto_tsqueryで記号崩れを防ぐ（ORよりAND寄りになるが安全性優先）
+                    tsquery_str = " ".join(safe_tokens)
+
                     sql = """
                         SELECT chunk_id, content, metadata,
-                               ts_rank(to_tsvector('simple', tokenized_content), to_tsquery('simple', :tsquery)) AS score
+                               ts_rank(to_tsvector('simple', tokenized_content), plainto_tsquery('simple', :tsquery)) AS score
                         FROM document_chunks
-                        WHERE to_tsvector('simple', tokenized_content) @@ to_tsquery('simple', :tsquery)
+                        WHERE to_tsvector('simple', tokenized_content) @@ plainto_tsquery('simple', :tsquery)
                               AND collection_name = :collection_name
                         ORDER BY score DESC LIMIT :k;
                     """
@@ -123,6 +124,7 @@ class JapaneseHybridRetriever(BaseRetriever):
                     
         except Exception as exc:
             print(f"[HybridRetriever] keyword search error: {exc}")
+            return []
         return res
 
     @staticmethod

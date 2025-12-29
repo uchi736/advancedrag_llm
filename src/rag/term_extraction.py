@@ -596,55 +596,60 @@ class TermExtractor:
         all_candidates = []
         chain = self.candidate_extraction_prompt | self.llm | self._to_text | self.json_parser
 
+        # Windows select()の制限回避: 同時実行数を制限（512ファイルディスクリプタ上限）
+        max_concurrent = getattr(self.config, 'max_concurrent_llm_calls', 20)
+        semaphore = asyncio.Semaphore(max_concurrent)
+
         async def extract_from_chunk(i: int, chunk: str):
             """1つのチャンクから候補を抽出"""
-            try:
-                # Trace only the first chunk to avoid excessive LangSmith requests
-                from langchain_core.runnables import RunnableConfig
-                config = RunnableConfig(
-                    run_name=f"[TermExtraction] Stage1-CandidateExtraction",
-                    tags=["term_extraction", "stage1", "sample"],
-                    metadata={
-                        "chunk_index": i,
-                        "total_chunks": len(chunks),
-                        "is_sample": True
-                    }
-                ) if i == 0 else None
+            async with semaphore:  # 同時実行数を制限
+                try:
+                    # Trace only the first chunk to avoid excessive LangSmith requests
+                    from langchain_core.runnables import RunnableConfig
+                    config = RunnableConfig(
+                        run_name=f"[TermExtraction] Stage1-CandidateExtraction",
+                        tags=["term_extraction", "stage1", "sample"],
+                        metadata={
+                            "chunk_index": i,
+                            "total_chunks": len(chunks),
+                            "is_sample": True
+                        }
+                    ) if i == 0 else None
 
-                result = await chain.ainvoke({
-                    "text": chunk,
-                    "format_instructions": self.json_parser.get_format_instructions()
-                }, config=config)
+                    result = await chain.ainvoke({
+                        "text": chunk,
+                        "format_instructions": self.json_parser.get_format_instructions()
+                    }, config=config)
 
-                # 結果の処理
-                if hasattr(result, "terms"):
-                    candidates = result.terms
-                elif isinstance(result, dict):
-                    candidates = result.get("terms", [])
-                else:
-                    candidates = []
-
-                # 辞書形式に変換
-                chunk_candidates = []
-                for candidate in candidates:
-                    if hasattr(candidate, "dict"):
-                        cand_dict = candidate.dict()
-                    elif isinstance(candidate, dict):
-                        cand_dict = candidate
+                    # 結果の処理
+                    if hasattr(result, "terms"):
+                        candidates = result.terms
+                    elif isinstance(result, dict):
+                        candidates = result.get("terms", [])
                     else:
-                        continue
+                        candidates = []
 
-                    # headwordフィールドに変換
-                    if "term" in cand_dict:
-                        cand_dict["headword"] = cand_dict.pop("term")
+                    # 辞書形式に変換
+                    chunk_candidates = []
+                    for candidate in candidates:
+                        if hasattr(candidate, "dict"):
+                            cand_dict = candidate.dict()
+                        elif isinstance(candidate, dict):
+                            cand_dict = candidate
+                        else:
+                            continue
 
-                    chunk_candidates.append(cand_dict)
+                        # headwordフィールドに変換
+                        if "term" in cand_dict:
+                            cand_dict["headword"] = cand_dict.pop("term")
 
-                return chunk_candidates
+                        chunk_candidates.append(cand_dict)
 
-            except Exception as e:
-                logger.error(f"Error in candidate extraction for chunk {i+1}: {e}")
-                return []
+                    return chunk_candidates
+
+                except Exception as e:
+                    logger.error(f"Error in candidate extraction for chunk {i+1}: {e}")
+                    return []
 
         # 並列実行（プログレスバー付き）
         tasks = [extract_from_chunk(i, chunk) for i, chunk in enumerate(chunks)]

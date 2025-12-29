@@ -161,3 +161,4 @@ class Config:
     # Term extraction settings (LLM-based)
     llm_extraction_chunk_size: int = 3000  # Text chunk size for LLM processing
     stage2_batch_size: int = 50  # Batch size for Stage 2 technical term filtering
+    max_concurrent_llm_calls: int = 20  # Max concurrent LLM calls (Windows select() limit workaround)

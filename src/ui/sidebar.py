@@ -22,10 +22,24 @@ def render_sidebar(rag_system, env_defaults):
     with st.sidebar:
         st.markdown("<h2 style='color: var(--text-primary);'>⚙️ Configuration</h2>", unsafe_allow_html=True)
         if rag_system:
-            st.success(f"✅ System Online (Azure) - Collection: **{rag_system.config.collection_name}**")
+            st.success(f"✅ System Online - Collection: **{rag_system.config.collection_name}**")
+
+            # LLM Provider info
+            provider = (rag_system.config.llm_provider or "azure").upper()
+            if provider == "VLLM":
+                endpoint = rag_system.config.vllm_endpoint or "未設定"
+                st.info(f"🤖 LLM: **{provider}**\n\n`{endpoint}`")
+            elif provider == "AZURE":
+                deployment = rag_system.config.azure_openai_chat_deployment_name or "未設定"
+                st.info(f"🤖 LLM: **{provider}**\n\n`{deployment}`")
+            elif provider == "HUGGINGFACE":
+                model = rag_system.config.hf_model_id or "未設定"
+                st.info(f"🤖 LLM: **{provider}**\n\n`{model}`")
+            else:
+                st.info(f"🤖 LLM: **{provider}**")
         else:
             st.warning("⚠️ System Offline")
-        
+
         st.info("すべての設定は「詳細設定」タブで行えます。")
 
         # Add search type selection

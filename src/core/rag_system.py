@@ -39,10 +39,12 @@ from src.rag.sql_handler import SQLHandler
 from src.rag.evaluator import RAGEvaluator, EvaluationResults, EvaluationMetrics
 from src.rag.prompts import (
     get_jargon_extraction_prompt,
+    get_entity_extraction_prompt,
     get_query_augmentation_prompt,
     get_query_expansion_prompt,
     get_reranking_prompt,
-    get_answer_generation_prompt
+    get_answer_generation_prompt,
+    get_hyde_prompt
 )
 from langchain_core.runnables import RunnablePassthrough, RunnableLambda, RunnableBranch, Runnable
 
@@ -188,6 +190,9 @@ class RAGSystem:
             distance_strategy=distance_strategy
         )
 
+        # Auto-repair PGVector schema for langchain-community compatibility
+        self._ensure_pgvector_schema()
+
         # Use Japanese hybrid retriever for PGVector
         self.retriever = JapaneseHybridRetriever(
             vector_store=self.vector_store,
@@ -235,6 +240,83 @@ class RAGSystem:
 
         # Initialize evaluator
         self.evaluator = None  # Lazy initialization to avoid overhead when not needed
+
+    def _ensure_pgvector_schema(self):
+        """
+        PGVectorテーブル(langchain_pg_embedding)のスキーマを自動修復。
+        langchain-community 0.3.x以降で必要なカラム・制約を確保する。
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+
+        try:
+            with self.engine.connect() as conn:
+                # テーブルが存在するか確認
+                result = conn.execute(text("""
+                    SELECT EXISTS (
+                        SELECT FROM information_schema.tables
+                        WHERE table_name = 'langchain_pg_embedding'
+                    );
+                """))
+                if not result.scalar():
+                    logger.debug("langchain_pg_embedding table does not exist yet, skipping schema repair")
+                    return
+
+                # 1. 必要なカラムを追加 (custom_id, uuid)
+                conn.execute(text("""
+                    ALTER TABLE langchain_pg_embedding
+                    ADD COLUMN IF NOT EXISTS custom_id VARCHAR;
+                """))
+                conn.execute(text("""
+                    ALTER TABLE langchain_pg_embedding
+                    ADD COLUMN IF NOT EXISTS uuid UUID;
+                """))
+
+                # 2. 主キー制約を確認・修正 (id → uuid)
+                pk_result = conn.execute(text("""
+                    SELECT constraint_name, column_name
+                    FROM information_schema.key_column_usage
+                    WHERE table_name = 'langchain_pg_embedding'
+                    AND constraint_name IN (
+                        SELECT constraint_name
+                        FROM information_schema.table_constraints
+                        WHERE table_name = 'langchain_pg_embedding'
+                        AND constraint_type = 'PRIMARY KEY'
+                    );
+                """))
+                pk_info = pk_result.fetchone()
+
+                if pk_info and pk_info[1] == 'id':
+                    # 主キーがidの場合、uuidに変更
+                    logger.info("Migrating primary key from 'id' to 'uuid'...")
+
+                    # 既存の主キー制約を削除
+                    conn.execute(text(f"""
+                        ALTER TABLE langchain_pg_embedding DROP CONSTRAINT {pk_info[0]};
+                    """))
+
+                    # NULLのuuidにランダム値を設定
+                    conn.execute(text("""
+                        UPDATE langchain_pg_embedding SET uuid = gen_random_uuid() WHERE uuid IS NULL;
+                    """))
+
+                    # uuidを主キーに設定
+                    conn.execute(text("""
+                        ALTER TABLE langchain_pg_embedding ADD PRIMARY KEY (uuid);
+                    """))
+
+                    # idのNOT NULL制約を外す
+                    conn.execute(text("""
+                        ALTER TABLE langchain_pg_embedding ALTER COLUMN id DROP NOT NULL;
+                    """))
+
+                    logger.info("Primary key migration completed: id -> uuid")
+
+                conn.commit()
+                logger.debug("PGVector schema check/repair completed")
+
+        except Exception as e:
+            logger.warning(f"PGVector schema repair failed (may be ok if table is new): {e}")
 
     def _init_llms_and_embeddings(self):
         """Initialize LLM and embedding models based on configured provider."""
@@ -346,26 +428,31 @@ class RAGSystem:
             raise
 
     def _init_vllm_models(self):
-        """Initialize VLLM models."""
-        from src.rag.vllm_client import VLLMChatClient
+        """Initialize VLLM models via OpenAI-compatible API."""
+        from langchain_openai import ChatOpenAI
         import logging
         logger = logging.getLogger(__name__)
 
         if not self.config.vllm_endpoint:
             raise ValueError("VLLM endpoint is required for vllm provider")
 
-        # Initialize VLLM LLM
-        self.llm = VLLMChatClient(
-            endpoint=self.config.vllm_endpoint,
+        # Ensure endpoint ends with /v1 for OpenAI-compatible API
+        endpoint = self.config.vllm_endpoint
+        if not endpoint.endswith("/v1"):
+            endpoint = endpoint.rstrip("/") + "/v1"
+
+        # Initialize VLLM LLM via ChatOpenAI (OpenAI-compatible API)
+        self.llm = ChatOpenAI(
+            base_url=endpoint,
+            api_key=self.config.vllm_api_key or "EMPTY",
+            model=self.config.vllm_model,
             temperature=self.config.vllm_temperature,
-            top_p=self.config.vllm_top_p,
-            top_k=self.config.vllm_top_k,
-            min_p=self.config.vllm_min_p,
             max_tokens=self.config.vllm_max_tokens,
-            reasoning_effort=self.config.vllm_reasoning_effort,
-            timeout=self.config.vllm_timeout
         )
-        logger.info(f"Loaded VLLM client from endpoint: {self.config.vllm_endpoint}")
+        logger.info(f"Loaded VLLM via OpenAI-compatible API: {endpoint}")
+        logger.info(f"  Model: {self.config.vllm_model or '(server default)'}")
+        logger.info(f"  Temperature: {self.config.vllm_temperature}, Max Tokens: {self.config.vllm_max_tokens}")
+        logger.info(f"  Reasoning Effort: {self.config.vllm_reasoning_effort}")
 
         # For embeddings, we still use Azure OpenAI (VLLM doesn't provide embedding models)
         self.embeddings = AzureOpenAIEmbeddings(
@@ -510,20 +597,42 @@ class RAGSystem:
 
         # Step 1: Extract jargon terms from query (if enabled)
         def extract_jargon(inputs: Dict) -> Dict:
-            """Extract technical terms from the query"""
+            """Extract entities from the query (not limited to jargon)"""
             question = inputs.get("question", "")
             if not question or not inputs.get("use_jargon_augmentation", False):
                 inputs["jargon_terms"] = []
                 return inputs
 
             try:
-                jargon_prompt = get_jargon_extraction_prompt()
-                response = self.llm.invoke(jargon_prompt.format(question=question))
-
-                # Parse terms from response
                 import re
-                terms = re.findall(r'[ぁ-んァ-ヴー一-龠a-zA-Z0-9]+', response.content if hasattr(response, 'content') else str(response))
-                inputs["jargon_terms"] = terms[:5]  # Limit to top 5
+
+                # Set to False to revert to the legacy "jargon-only" extractor
+                use_entity_prompt = True
+                max_entities = 8
+                extraction_prompt = (
+                    get_entity_extraction_prompt(max_entities=max_entities)
+                    if use_entity_prompt else
+                    get_jargon_extraction_prompt(max_terms=max_entities)
+                )
+                response = self.llm.invoke(extraction_prompt.format(question=question))
+
+                raw_text = response.content if hasattr(response, 'content') else str(response)
+                candidates = [t.strip() for t in re.split(r'[,\n]+', raw_text) if t.strip()]
+                if not candidates:
+                    # Fallback regex for Japanese/English tokens
+                    candidates = re.findall(r'[\u4e00-\u9fff\u3040-\u30ffA-Za-z0-9-]+', raw_text)
+
+                # Deduplicate while preserving order
+                seen = set()
+                terms = []
+                for t in candidates:
+                    key = t.lower()
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    terms.append(t)
+
+                inputs["jargon_terms"] = terms[:max_entities]
             except Exception as e:
                 logger.warning(f"Jargon extraction failed: {e}")
                 inputs["jargon_terms"] = []
@@ -642,6 +751,32 @@ class RAGSystem:
 
             return inputs
 
+        # Step 3.5: Generate hypothetical document for HyDE
+        def generate_hypothetical_document(inputs: Dict) -> Dict:
+            """Generate hypothetical document for HyDE-enhanced vector search"""
+            if not inputs.get("use_hyde", False):
+                inputs["hyde_document"] = None
+                inputs["hyde_info"] = {"enabled": False}
+                return inputs
+
+            try:
+                question = inputs.get("question", "")
+                hyde_prompt = get_hyde_prompt()
+                response = self.llm.invoke(hyde_prompt.format(question=question))
+                hyde_doc = response.content if hasattr(response, 'content') else str(response)
+                inputs["hyde_document"] = hyde_doc.strip()
+                inputs["hyde_info"] = {
+                    "enabled": True,
+                    "hyde_document": hyde_doc.strip()[:200] + "..." if len(hyde_doc) > 200 else hyde_doc.strip()
+                }
+                logger.info(f"HyDE document generated: {inputs['hyde_info']['hyde_document'][:100]}...")
+            except Exception as e:
+                logger.warning(f"HyDE generation failed: {e}")
+                inputs["hyde_document"] = None
+                inputs["hyde_info"] = {"enabled": False, "error": str(e)}
+
+            return inputs
+
         # Step 4: Retrieve documents (with optional RAG fusion)
         def retrieve_documents(inputs: Dict) -> Dict:
             """Retrieve documents using configured search type"""
@@ -671,7 +806,33 @@ class RAGSystem:
                 else:
                     # Single query retrieval
                     query = queries[0] if queries else inputs.get("question", "")
-                    inputs["documents"] = self.retriever.invoke(query)[:self.config.final_k] if query else []
+                    hyde_document = inputs.get("hyde_document")
+
+                    # HyDE-enhanced retrieval: use hypothetical document for vector search
+                    if hyde_document and search_type in ("hybrid", "vector"):
+                        # Vector search with hyde_document
+                        vector_docs = self.vector_store.similarity_search(
+                            hyde_document,
+                            k=self.config.vector_search_k * 2
+                        )
+                        # Filter out jargon_term type
+                        vector_docs = [d for d in vector_docs if d.metadata.get("type") != "jargon_term"][:self.config.vector_search_k]
+
+                        if search_type == "hybrid":
+                            # Keyword search with original query
+                            self.retriever.search_type = "keyword"
+                            keyword_docs = self.retriever.invoke(query) if query else []
+                            # Merge vector and keyword results using RRF
+                            inputs["documents"] = _reciprocal_rank_fusion([vector_docs, keyword_docs])[:self.config.final_k]
+                        else:
+                            # Vector only
+                            inputs["documents"] = vector_docs[:self.config.final_k]
+
+                        logger.info(f"HyDE retrieval: vector={len(vector_docs)}, final={len(inputs['documents'])}")
+                    else:
+                        # Standard retrieval (no HyDE)
+                        inputs["documents"] = self.retriever.invoke(query)[:self.config.final_k] if query else []
+
                     inputs["golden_retriever"] = {"enabled": False}
 
             except Exception as e:
@@ -722,6 +883,7 @@ class RAGSystem:
             RunnableLambda(extract_jargon)
             | RunnableLambda(augment_with_jargon)
             | RunnableLambda(expand_query)
+            | RunnableLambda(generate_hypothetical_document)
             | RunnableLambda(retrieve_documents)
             | RunnableLambda(rerank_documents)
             | RunnableLambda(add_retrieval_query)
@@ -900,6 +1062,7 @@ class RAGSystem:
         use_jargon_augmentation: bool = False,
         use_reverse_lookup: bool = False,
         use_reranking: bool = False,
+        use_hyde: bool = False,
         search_type: str = None,  # None uses config.default_search_type
         config: Any = None
     ) -> Dict[str, Any]:
@@ -912,6 +1075,7 @@ class RAGSystem:
             use_jargon_augmentation: Enable jargon augmentation
             use_reverse_lookup: Enable reverse lookup (description → technical term)
             use_reranking: Enable LLM reranking
+            use_hyde: Enable HyDE (Hypothetical Document Embeddings)
             search_type: Search type ("ハイブリッド検索", "ベクトル検索", "キーワード検索")
             config: Optional RunnableConfig for tracing
 
@@ -1018,6 +1182,7 @@ class RAGSystem:
                 "use_rag_fusion": use_rag_fusion,
                 "use_jargon_augmentation": use_jargon_augmentation,
                 "use_reranking": use_reranking,
+                "use_hyde": use_hyde,
                 "search_type": search_type_eng,
                 "config": config
             }
@@ -1079,7 +1244,8 @@ class RAGSystem:
                 "golden_retriever": retrieval_result.get("golden_retriever", {}),
                 "jargon_augmentation": retrieval_result.get("jargon_augmentation", {}),
                 "reverse_lookup": reverse_lookup_info,
-                "reranking": retrieval_result.get("reranking", {})
+                "reranking": retrieval_result.get("reranking", {}),
+                "hyde_info": retrieval_result.get("hyde_info", {})
             }
 
             return result

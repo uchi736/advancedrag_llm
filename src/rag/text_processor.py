@@ -2,8 +2,9 @@ import unicodedata
 import re
 from typing import List
 
-# SudachiPy is no longer used (removed in favor of LLM-based processing)
-SUDACHI_AVAILABLE = False
+from sudachipy import dictionary, tokenizer
+
+SUDACHI_AVAILABLE = True
 
 class JapaneseTextProcessor:
     """A utility class for Japanese text processing using SudachiPy."""

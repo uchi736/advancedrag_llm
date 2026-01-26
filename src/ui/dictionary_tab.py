@@ -199,6 +199,29 @@ def render_dictionary_tab(rag_system):
         key="term_output_json"
     )
 
+    # Stage 2.5 Self-Reflection 設定
+    with st.expander("⚙️ 詳細設定", expanded=False):
+        enable_stage25 = st.checkbox(
+            "Stage 2.5 自己反省を有効化",
+            value=True,
+            help="用語リストの品質向上のための反復的な自己反省と改善を実行します。無効にすると処理が高速化されますが、品質が低下する可能性があります。",
+            key="enable_stage25"
+        )
+
+        # Stage 4 分野分類方式の選択
+        domain_method = st.selectbox(
+            "分野分類方式 (Stage 4)",
+            options=["llm", "hdbscan", "hybrid"],
+            index=0,
+            format_func=lambda x: {
+                "llm": "LLM方式（柔軟、毎回LLM判定）",
+                "hdbscan": "クラスタリング方式（高速、HDBSCAN+UMAP）",
+                "hybrid": "ハイブリッド（用語数で自動切替）"
+            }.get(x, x),
+            help="llm: LLMが分野を直接判定。hdbscan: エンベディングのクラスタリングで分類。hybrid: 用語数10個以上でhdbscanを使用。",
+            key="stage4_domain_method"
+        )
+
     if st.button("🚀 用語を抽出・生成", type="primary", use_container_width=True, key="run_term_extraction", disabled=not has_vector_data):
         if not hasattr(rag_system, 'jargon_manager') or rag_system.jargon_manager is None:
             st.error("用語辞書機能は現在利用できません。")
@@ -263,6 +286,10 @@ def render_dictionary_tab(rag_system):
                         with st.status("用語抽出中...", expanded=True) as status:
                             # Get latest rag_system from session state to ensure correct collection_name
                             current_rag = st.session_state.get("rag_system", rag_system)
+                            # 詳細設定を反映
+                            if hasattr(current_rag, 'config'):
+                                current_rag.config.enable_stage25_refinement = enable_stage25
+                                current_rag.config.stage4_domain_method = domain_method
                             asyncio.run(current_rag.extract_terms(input_path, str(output_path), ui_callback=ui_callback))
                             status.update(label="✅ 抽出完了!", state="complete")
 
@@ -314,6 +341,10 @@ def render_dictionary_tab(rag_system):
                         with st.status("用語抽出中...", expanded=True) as status:
                             # Get latest rag_system from session state to ensure correct collection_name
                             current_rag = st.session_state.get("rag_system", rag_system)
+                            # 詳細設定を反映
+                            if hasattr(current_rag, 'config'):
+                                current_rag.config.enable_stage25_refinement = enable_stage25
+                                current_rag.config.stage4_domain_method = domain_method
                             asyncio.run(current_rag.extract_terms(input_path, str(output_path), ui_callback=ui_callback))
                             status.update(label="✅ 抽出完了!", state="complete")
 

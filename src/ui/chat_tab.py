@@ -74,7 +74,7 @@ def _render_initial_chat_view(rag):
     st.markdown('<div class="initial-input-container">', unsafe_allow_html=True)
 
     st.markdown("<h6>高度なRAG設定:</h6>", unsafe_allow_html=True)
-    opt_cols_initial = st.columns(5)
+    opt_cols_initial = st.columns(6)
     with opt_cols_initial[0]:
         use_qe_initial = st.checkbox("クエリ拡張", value=st.session_state.use_query_expansion, key="use_qe_initial_v7_tab_chat", help="質問を自動的に拡張して検索 (RRFなし)")
     with opt_cols_initial[1]:
@@ -85,6 +85,8 @@ def _render_initial_chat_view(rag):
         use_rl_initial = st.checkbox("逆引き検索", value=st.session_state.use_reverse_lookup, key="use_rl_initial_v7_tab_chat", help="説明文から専門用語を抽出")
     with opt_cols_initial[4]:
         use_rr_initial = st.checkbox("LLMリランク", value=st.session_state.use_reranking, key="use_rr_initial_v7_tab_chat", help="LLMで検索結果を並べ替え")
+    with opt_cols_initial[5]:
+        use_hyde_initial = st.checkbox("HyDE", value=st.session_state.use_hyde, key="use_hyde_initial_v7_tab_chat", help="仮説回答でベクトル検索 (LLM+1)")
 
     user_input_initial = st.text_area("質問を入力:", placeholder="例：このドキュメントの要約を教えてください / 売上上位10件を表示して", height=100, key="initial_input_textarea_v7_tab_chat", label_visibility="collapsed")
 
@@ -96,6 +98,7 @@ def _render_initial_chat_view(rag):
             st.session_state.use_jargon_augmentation = use_ja_initial
             st.session_state.use_reverse_lookup = use_rl_initial
             st.session_state.use_reranking = use_rr_initial
+            st.session_state.use_hyde = use_hyde_initial
             _handle_query(rag, user_input_initial, "initial_input")
             st.rerun()
             
@@ -119,7 +122,7 @@ def _render_continued_chat_view(rag):
 
         st.markdown("---")
 
-        opt_cols_chat = st.columns(5)
+        opt_cols_chat = st.columns(6)
         with opt_cols_chat[0]:
             use_qe_chat = st.checkbox("クエリ拡張", value=st.session_state.use_query_expansion, key="use_qe_chat_continued_v7_tab_chat", help="クエリ拡張 (RRFなし)")
         with opt_cols_chat[1]:
@@ -130,6 +133,8 @@ def _render_continued_chat_view(rag):
             use_rl_chat = st.checkbox("逆引き検索", value=st.session_state.use_reverse_lookup, key="use_rl_chat_continued_v7_tab_chat", help="説明文から専門用語を抽出")
         with opt_cols_chat[4]:
             use_rr_chat = st.checkbox("LLMリランク", value=st.session_state.use_reranking, key="use_rr_chat_continued_v7_tab_chat", help="LLMで検索結果を並べ替え")
+        with opt_cols_chat[5]:
+            use_hyde_chat = st.checkbox("HyDE", value=st.session_state.use_hyde, key="use_hyde_chat_continued_v7_tab_chat", help="仮説回答でベクトル検索 (LLM+1)")
 
         user_input_continued = st.text_area(
             "メッセージを入力:",
@@ -146,6 +151,7 @@ def _render_continued_chat_view(rag):
                 st.session_state.use_jargon_augmentation = use_ja_chat
                 st.session_state.use_reverse_lookup = use_rl_chat
                 st.session_state.use_reranking = use_rr_chat
+                st.session_state.use_hyde = use_hyde_chat
                 _handle_query(rag, user_input_continued, "continued_chat")
                 st.rerun()
 
@@ -158,6 +164,7 @@ def _render_continued_chat_view(rag):
                 st.session_state.last_golden_retriever = {}
                 st.session_state.last_reranking = {}
                 st.session_state.last_jargon_augmentation = {}
+                st.session_state.last_hyde = {}
                 st.rerun()
         with info_col:
             _render_query_info()
@@ -184,6 +191,7 @@ def _handle_query(rag, user_input, query_source):
                     "use_jargon_augmentation": st.session_state.use_jargon_augmentation,
                     "use_reverse_lookup": st.session_state.use_reverse_lookup,
                     "use_reranking": st.session_state.use_reranking,
+                    "use_hyde": st.session_state.use_hyde,
                     "query_source": query_source
                 }
             )
@@ -195,6 +203,7 @@ def _handle_query(rag, user_input, query_source):
                 use_jargon_augmentation=st.session_state.use_jargon_augmentation,
                 use_reverse_lookup=st.session_state.use_reverse_lookup,
                 use_reranking=st.session_state.use_reranking,
+                use_hyde=st.session_state.use_hyde,
                 search_type=st.session_state.get('search_type', 'ハイブリッド検索'),
                 config=trace_config
             )
@@ -213,6 +222,7 @@ def _handle_query(rag, user_input, query_source):
             st.session_state.last_reranking = response.get("reranking", {})
             st.session_state.last_jargon_augmentation = response.get("jargon_augmentation", {})
             st.session_state.last_reverse_lookup = response.get("reverse_lookup", {})
+            st.session_state.last_hyde = response.get("hyde_info", {})
             
             # Temporary: Add mock data if query expansion is enabled
             if st.session_state.use_query_expansion and not st.session_state.last_query_expansion:
@@ -260,6 +270,7 @@ def _render_query_info():
         st.write(f"last_jargon_augmentation: {st.session_state.get('last_jargon_augmentation', 'None')}")
         st.write(f"last_reranking: {st.session_state.get('last_reranking', 'None')}")
         st.write(f"last_golden_retriever: {st.session_state.get('last_golden_retriever', 'None')}")
+        st.write(f"last_hyde: {st.session_state.get('last_hyde', 'None')}")
     
     # Query processing details
     if any([
@@ -267,7 +278,8 @@ def _render_query_info():
         st.session_state.get("last_golden_retriever"),
         st.session_state.get("last_reranking"),
         st.session_state.get("last_jargon_augmentation"),
-        st.session_state.get("last_reverse_lookup")
+        st.session_state.get("last_reverse_lookup"),
+        st.session_state.get("last_hyde")
     ]):
         with st.expander("🔍 クエリ処理の詳細", expanded=True):
             
@@ -332,6 +344,16 @@ def _render_query_info():
                     st.write("**拡張後クエリ:**")
                     st.markdown("```text\n" + reverse_info['augmented_query'] + "\n```")
 
+                st.divider()
+
+            # HyDE details
+            if st.session_state.get("last_hyde") and st.session_state.last_hyde.get("enabled"):
+                st.markdown("**📝 HyDE (仮説回答生成)**")
+                hyde_info = st.session_state.last_hyde
+                if hyde_info.get("hyde_document"):
+                    st.write("**生成された仮説回答:**")
+                    st.markdown("```text\n" + hyde_info['hyde_document'] + "\n```")
+                    st.caption("💡 この仮説回答のembeddingを使ってベクトル検索を実行しました")
                 st.divider()
 
             # Query expansion details

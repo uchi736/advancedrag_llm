@@ -120,9 +120,28 @@ REVERSE_LOOKUP_QUERY_EXPANSION = """あなたは検索クエリ最適化の専�
 「改良後の検索クエリ:」「クエリ:」などのラベルや前置きは一切含めないでください。
 """
 
+# HyDE (Hypothetical Document Embeddings) prompt
+HYDE_PROMPT = """あなたは専門技術文書の著者です。以下の質問に対して、技術文書に書かれているような形式で回答を作成してください。
+
+【重要な指示】
+- 実際の技術文書のような文体・表現で書く
+- 専門用語を適切に使用する
+- 具体的かつ詳細に説明する
+- 箇条書きや段落を使って構造化する
+- 150-300文字程度
+
+【質問】
+{question}
+
+【回答】"""
+
 # Convenience functions to get ChatPromptTemplate objects
 def get_jargon_extraction_prompt(max_terms=5):
     template = JARGON_EXTRACTION.replace("{{max_terms}}", str(max_terms))
+    return ChatPromptTemplate.from_template(template)
+
+def get_entity_extraction_prompt(max_entities=8):
+    template = ENTITY_EXTRACTION.replace("{{max_entities}}", str(max_entities))
     return ChatPromptTemplate.from_template(template)
 
 def get_query_augmentation_prompt():
@@ -139,6 +158,9 @@ def get_answer_generation_prompt():
 
 def get_reverse_lookup_query_expansion_prompt():
     return ChatPromptTemplate.from_template(REVERSE_LOOKUP_QUERY_EXPANSION)
+
+def get_hyde_prompt():
+    return ChatPromptTemplate.from_template(HYDE_PROMPT)
 
 # Term extraction prompts
 DEFINITION_GENERATION_SYSTEM_PROMPT = """あなたは専門用語の定義作成の専門家です。

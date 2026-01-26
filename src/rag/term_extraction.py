@@ -34,6 +34,13 @@ from tqdm import tqdm
 # LangGraph imports
 from langgraph.graph import StateGraph, END
 
+# Domain classification (optional)
+try:
+    from src.rag.term_clustering import TermClusteringAnalyzer, CLUSTERING_AVAILABLE
+except ImportError:
+    CLUSTERING_AVAILABLE = False
+    TermClusteringAnalyzer = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -990,13 +997,15 @@ class TermExtractor:
 
                 for attempt in range(max_retries):
                     try:
-                        # 定義生成用: フィルタなしでk*2件取得 → 手動でjargon_term除外 → k件
+                        # 定義生成用: type='document'のみ検索（jargon_termを除外）
                         docs = []
                         if self.vector_store:
-                            all_docs = self.vector_store.similarity_search(headword, k=10)
-                            logger.info(f"[Stage3 RAG] '{headword}': similarity_search returned {len(all_docs)} docs")
-                            docs = [d for d in all_docs if d.metadata.get('type') != 'jargon_term'][:5]
-                            logger.info(f"[Stage3 RAG] '{headword}': after jargon filter = {len(docs)} docs")
+                            docs = self.vector_store.similarity_search(
+                                headword,
+                                k=5,
+                                filter={"type": "document"}
+                            )
+                            logger.info(f"[Stage3 RAG] '{headword}': found {len(docs)} document chunks")
                         else:
                             logger.warning(f"[Stage3 RAG] '{headword}': vector_store is None!")
 
@@ -1051,11 +1060,14 @@ class TermExtractor:
                 # Override chain.ainvoke to use config for this call only
                 headword = term.get("headword", "")
                 if headword:
-                    # フィルタなしでk*2件取得 → 手動でjargon_term除外 → k件
+                    # type='document'のみ検索（jargon_termを除外）
                     docs = []
                     if self.vector_store:
-                        all_docs = self.vector_store.similarity_search(headword, k=10)
-                        docs = [d for d in all_docs if d.metadata.get('type') != 'jargon_term'][:5]
+                        docs = self.vector_store.similarity_search(
+                            headword,
+                            k=5,
+                            filter={"type": "document"}
+                        )
 
                     if docs:
                         context = "\n\n".join([doc.page_content for doc in docs])[:3000]
@@ -1188,6 +1200,109 @@ class TermExtractor:
         except Exception as e:
             logger.error(f"Batch grouping failed: {e}")
             return terms
+
+    async def _detect_and_merge_term_synonyms_hdbscan(self, technical_terms: List[Dict]) -> List[Dict]:
+        """HDBSCAN + UMAP によるドメイン分類ベースの類義語グループ化（Stage 4a代替）"""
+        if not technical_terms:
+            return technical_terms
+
+        # クラスタリングライブラリの可用性チェック
+        if not CLUSTERING_AVAILABLE or TermClusteringAnalyzer is None:
+            logger.warning("Clustering libraries not available, falling back to LLM method")
+            print("[WARN] クラスタリングライブラリが利用できません。LLM方式にフォールバックします。\n")
+            return await self._detect_and_merge_term_synonyms(technical_terms)
+
+        min_terms = getattr(self.config, 'domain_min_terms_for_clustering', 10)
+
+        # 用語数が少なければLLM方式にフォールバック
+        if len(technical_terms) < min_terms:
+            logger.info(f"Too few terms ({len(technical_terms)} < {min_terms}), falling back to LLM method")
+            print(f"[INFO] 用語数が少ないため ({len(technical_terms)}個 < {min_terms}個)、LLM方式を使用します。\n")
+            return await self._detect_and_merge_term_synonyms(technical_terms)
+
+        try:
+            logger.info(f"Using HDBSCAN clustering for {len(technical_terms)} terms")
+            print(f"[Stage 4a] HDBSCAN + UMAPによるドメイン分類を実行中 ({len(technical_terms)}個)...")
+
+            # TermClusteringAnalyzer を初期化
+            analyzer = TermClusteringAnalyzer(
+                connection_string=self.pg_url,
+                min_terms=min_terms,
+                embeddings=self.embeddings,
+                llm=self.llm,
+                config=self.config
+            )
+
+            # 専門用語を形式変換
+            specialized_terms = [
+                {
+                    "term": t.get("headword"),
+                    "definition": t.get("definition", ""),
+                    "related_terms": t.get("synonyms", []),
+                    "text": f"{t.get('headword')}: {t.get('definition', '')}"
+                }
+                for t in technical_terms
+            ]
+
+            # クラスタリング実行
+            use_llm_naming = getattr(self.config, 'enable_domain_cluster_naming', True)
+            result = await analyzer.extract_semantic_synonyms_hybrid(
+                specialized_terms=specialized_terms,
+                candidate_terms=[],  # Stage 4bで処理
+                max_synonyms=5,
+                use_llm_naming=use_llm_naming
+            )
+
+            # 結果をterm_extraction形式に変換
+            cluster_names = result.get('cluster_names', {})
+            cluster_mapping = result.get('clusters', {})
+            synonyms_dict = result.get('synonyms', {})
+
+            # 元のtechnical_termsにドメイン情報と類義語を追加
+            for term in technical_terms:
+                headword = term.get("headword")
+                cluster_id = cluster_mapping.get(headword, -1)
+
+                # ドメイン名設定
+                if cluster_id >= 0 and cluster_id in cluster_names:
+                    term["domain"] = cluster_names[cluster_id]
+                else:
+                    term["domain"] = "未分類"
+
+                # 類義語追加
+                if headword in synonyms_dict:
+                    existing = set(term.get("synonyms", []))
+                    for syn in synonyms_dict[headword]:
+                        existing.add(syn["term"])
+                    term["synonyms"] = list(existing)
+
+            n_clusters = len(set(cluster_names.values())) if cluster_names else 0
+            logger.info(f"HDBSCAN clustering complete: {n_clusters} clusters detected")
+            print(f"[OK] HDBSCANクラスタリング完了: {n_clusters}個のクラスタを検出\n")
+
+            return technical_terms
+
+        except Exception as e:
+            logger.error(f"HDBSCAN clustering failed: {e}")
+            print(f"[WARN] HDBSCANクラスタリングでエラーが発生しました: {e}\n")
+            print("[INFO] LLM方式にフォールバックします。\n")
+            return await self._detect_and_merge_term_synonyms(technical_terms)
+
+    async def _detect_and_merge_term_synonyms_hybrid(self, technical_terms: List[Dict]) -> List[Dict]:
+        """ハイブリッド方式: 用語数に応じてLLMまたはHDBSCANを自動選択（Stage 4a代替）"""
+        if not technical_terms:
+            return technical_terms
+
+        threshold = getattr(self.config, 'domain_min_terms_for_clustering', 10)
+
+        if len(technical_terms) < threshold:
+            logger.info(f"Using LLM method (terms: {len(technical_terms)} < threshold: {threshold})")
+            print(f"[Stage 4a] LLM方式を使用（用語数: {len(technical_terms)} < 閾値: {threshold}）")
+            return await self._detect_and_merge_term_synonyms(technical_terms)
+        else:
+            logger.info(f"Using HDBSCAN method (terms: {len(technical_terms)} >= threshold: {threshold})")
+            print(f"[Stage 4a] HDBSCAN方式を使用（用語数: {len(technical_terms)} >= 閾値: {threshold}）")
+            return await self._detect_and_merge_term_synonyms_hdbscan(technical_terms)
 
     async def _detect_synonyms_with_candidates(self, representative_terms: List[Dict], all_candidates: List[Dict]) -> List[Dict]:
         """類義語の検出（代表語と一般語候補、Stage 4b）"""
@@ -1347,29 +1462,40 @@ class TermExtractor:
         # ワークフロー定義
         workflow = StateGraph(TermExtractionState)
 
+        # Stage 2.5 ON/OFF設定
+        enable_stage25 = getattr(self.config, 'enable_stage25_refinement', True)
+
         # ノード追加
         workflow.add_node("stage1_extract_candidates", self._node_stage1_extract_candidates)
         workflow.add_node("stage2_initial_filter", self._node_stage2_initial_filter)
-        workflow.add_node("stage25_self_reflection", self._node_stage25_self_reflection)
-        workflow.add_node("stage25_refine_terms", self._node_stage25_refine_terms)
         workflow.add_node("stage3_generate_definitions", self._node_stage3_generate_definitions)
         workflow.add_node("stage4_detect_synonyms", self._node_stage4_detect_synonyms)
 
         # エッジ定義
         workflow.set_entry_point("stage1_extract_candidates")
         workflow.add_edge("stage1_extract_candidates", "stage2_initial_filter")
-        workflow.add_edge("stage2_initial_filter", "stage25_self_reflection")
-        workflow.add_edge("stage25_self_reflection", "stage25_refine_terms")
 
-        # Stage 2.5 ループの条件分岐
-        workflow.add_conditional_edges(
-            "stage25_refine_terms",
-            self._should_continue_refinement,
-            {
-                "continue": "stage25_self_reflection",  # ループバック
-                "finish": "stage3_generate_definitions"  # 次のステージへ
-            }
-        )
+        if enable_stage25:
+            # Stage 2.5 有効時: Stage2 → Stage2.5 → Stage3
+            workflow.add_node("stage25_self_reflection", self._node_stage25_self_reflection)
+            workflow.add_node("stage25_refine_terms", self._node_stage25_refine_terms)
+            workflow.add_edge("stage2_initial_filter", "stage25_self_reflection")
+            workflow.add_edge("stage25_self_reflection", "stage25_refine_terms")
+
+            # Stage 2.5 ループの条件分岐
+            workflow.add_conditional_edges(
+                "stage25_refine_terms",
+                self._should_continue_refinement,
+                {
+                    "continue": "stage25_self_reflection",  # ループバック
+                    "finish": "stage3_generate_definitions"  # 次のステージへ
+                }
+            )
+            logger.info("[Workflow] Stage 2.5 Self-Reflection enabled")
+        else:
+            # Stage 2.5 無効時: Stage2 → Stage3 直接
+            workflow.add_edge("stage2_initial_filter", "stage3_generate_definitions")
+            logger.info("[Workflow] Stage 2.5 Self-Reflection disabled (skipped)")
 
         # 固定フロー
         workflow.add_edge("stage3_generate_definitions", "stage4_detect_synonyms")
@@ -1571,17 +1697,20 @@ class TermExtractor:
         avg_confidence = sum(confidence_scores) / len(confidence_scores) if confidence_scores else 0.5
         should_continue = avg_confidence < 0.9 or len(unique_issues) > 0 or len(unique_missing) > 0
 
+        # missing_termsの動的制限: 用語数の10%（最低5、最大30）
+        max_missing = max(5, min(30, len(technical_terms) // 10))
+
         reflection = {
             "issues_found": unique_issues,
             "confidence_in_current_list": avg_confidence,
             "suggested_actions": unique_actions,
             "should_continue": should_continue,
             "reasoning": " | ".join(all_reasonings) if all_reasonings else "バッチ処理完了",
-            "missing_terms": unique_missing[:10]  # 最大10個に制限
+            "missing_terms": unique_missing[:max_missing]
         }
 
         logger.info(f"Aggregated reflection: issues={len(unique_issues)}, "
-                   f"actions={len(unique_actions)}, missing={len(unique_missing)}, "
+                   f"actions={len(unique_actions)}, missing={len(unique_missing)} (max={max_missing}), "
                    f"avg_confidence={avg_confidence:.2f}")
 
         # デバッグ: パース後のreflection構造を確認（特にmissing_terms）
@@ -1686,7 +1815,7 @@ class TermExtractor:
 
             # アクションパース
             import re
-            # VLLMChatClientなどが返すSimpleAIMessageに対応
+            # AIMessageのcontent属性に対応
             content = getattr(result, "content", None)
             if content is None:
                 if hasattr(result, "strip"):
@@ -2064,14 +2193,23 @@ class TermExtractor:
         return state
 
     async def _node_stage4_detect_synonyms(self, state: TermExtractionState) -> TermExtractionState:
-        """Stage 4: 類義語検出ノード"""
+        """Stage 4: 類義語検出ノード（分野分類方式選択可能）"""
         logger.info("[Stage 4] Detecting synonyms...")
         print(f"[Stage 4] 類義語を検出中...")
 
-        # Stage 4a: 専門用語間の類義語
-        representative_terms = await self._detect_and_merge_term_synonyms(state["technical_terms"])
+        # 分野分類方式を取得
+        domain_method = getattr(self.config, 'stage4_domain_method', 'llm')
+        logger.info(f"Domain classification method: {domain_method}")
 
-        # Stage 4b: 代表語と候補の類義語
+        # Stage 4a: 専門用語間の類義語（方式に応じて分岐）
+        if domain_method == 'hdbscan':
+            representative_terms = await self._detect_and_merge_term_synonyms_hdbscan(state["technical_terms"])
+        elif domain_method == 'hybrid':
+            representative_terms = await self._detect_and_merge_term_synonyms_hybrid(state["technical_terms"])
+        else:  # デフォルト: llm
+            representative_terms = await self._detect_and_merge_term_synonyms(state["technical_terms"])
+
+        # Stage 4b: 代表語と候補の類義語（共通処理）
         if representative_terms and state["candidates"]:
             representative_terms = await self._detect_synonyms_with_candidates(
                 representative_terms,
@@ -2274,29 +2412,27 @@ async def _get_graph_for_cli():
         return HuggingFacePipeline(pipeline=pipe)
 
     def _build_vllm_llm():
-        # VLLM使用時のみimport
-        from src.rag.vllm_client import VLLMChatClient
+        # VLLM使用時のみimport (OpenAI-compatible API)
+        from langchain_openai import ChatOpenAI
         endpoint = getattr(config, "vllm_endpoint", None) or os.getenv("VLLM_ENDPOINT")
         if not endpoint:
             raise ValueError("VLLM endpoint is required for vllm provider")
 
-        vllm_temperature = getattr(config, "vllm_temperature", temperature)
-        vllm_top_p = getattr(config, "vllm_top_p", 0.7)
-        vllm_top_k = getattr(config, "vllm_top_k", 5)
-        vllm_min_p = getattr(config, "vllm_min_p", 0.0)
-        vllm_max_tokens = getattr(config, "vllm_max_tokens", max_tokens) or 4096
-        vllm_reasoning_effort = getattr(config, "vllm_reasoning_effort", "medium")
-        vllm_timeout = getattr(config, "vllm_timeout", 60)
+        # Ensure endpoint ends with /v1
+        if not endpoint.endswith("/v1"):
+            endpoint = endpoint.rstrip("/") + "/v1"
 
-        return VLLMChatClient(
-            endpoint=endpoint,
+        vllm_model = getattr(config, "vllm_model", "") or os.getenv("VLLM_MODEL", "")
+        vllm_api_key = getattr(config, "vllm_api_key", "EMPTY") or os.getenv("VLLM_API_KEY", "EMPTY")
+        vllm_temperature = getattr(config, "vllm_temperature", temperature)
+        vllm_max_tokens = getattr(config, "vllm_max_tokens", max_tokens) or 4096
+
+        return ChatOpenAI(
+            base_url=endpoint,
+            api_key=vllm_api_key,
+            model=vllm_model,
             temperature=vllm_temperature,
-            top_p=vllm_top_p,
-            top_k=vllm_top_k,
-            min_p=vllm_min_p,
             max_tokens=vllm_max_tokens,
-            reasoning_effort=vllm_reasoning_effort,
-            timeout=vllm_timeout
         )
 
     try:

@@ -997,15 +997,12 @@ class TermExtractor:
 
                 for attempt in range(max_retries):
                     try:
-                        # 定義生成用: type='document'のみ検索（jargon_termを除外）
+                        # 定義生成用: 多めに取得 → jargon_term除外 → 上位5件
                         docs = []
                         if self.vector_store:
-                            docs = self.vector_store.similarity_search(
-                                headword,
-                                k=5,
-                                filter={"type": "document"}
-                            )
-                            logger.info(f"[Stage3 RAG] '{headword}': found {len(docs)} document chunks")
+                            all_docs = self.vector_store.similarity_search(headword, k=20)
+                            docs = [d for d in all_docs if d.metadata.get('type') != 'jargon_term'][:5]
+                            logger.info(f"[Stage3 RAG] '{headword}': {len(all_docs)} total -> {len(docs)} document chunks")
                         else:
                             logger.warning(f"[Stage3 RAG] '{headword}': vector_store is None!")
 
@@ -1060,14 +1057,11 @@ class TermExtractor:
                 # Override chain.ainvoke to use config for this call only
                 headword = term.get("headword", "")
                 if headword:
-                    # type='document'のみ検索（jargon_termを除外）
+                    # 多めに取得 → jargon_term除外 → 上位5件
                     docs = []
                     if self.vector_store:
-                        docs = self.vector_store.similarity_search(
-                            headword,
-                            k=5,
-                            filter={"type": "document"}
-                        )
+                        all_docs = self.vector_store.similarity_search(headword, k=20)
+                        docs = [d for d in all_docs if d.metadata.get('type') != 'jargon_term'][:5]
 
                     if docs:
                         context = "\n\n".join([doc.page_content for doc in docs])[:3000]

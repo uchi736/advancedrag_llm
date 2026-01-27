@@ -7,7 +7,7 @@ LLMベースの専門用語抽出による辞書機能を実装したRAGA
 ### 🌟 主要な特徴
 
 - **LLMベース専門用語抽出**: LLMを使用した4ステージの用語抽出プロセス
-- **ハイブリッド検索**: PGVectorベクトル検索とPostgreSQL全文検索
+- **ハイブリッド検索**: PGVectorベクトル検索とBM25キーワード検索（SudachiPy形態素解析）
 - **専門用語クエリ拡張**:専門用語辞書によりクエリを拡張
 - **RAG定義生成**: LLMによる用語定義の自動生成
 - **類義語自動検出**: 候補プールから関連語を検出
@@ -151,9 +151,9 @@ sequenceDiagram
 ## 🔍 主な機能
 
 ### 検索・取得
-- **ハイブリッド検索**: ベクトル検索とキーワード検索をReciprocal Rank Fusion (RRF)で統合
+- **ハイブリッド検索**: ベクトル検索とBM25キーワード検索をReciprocal Rank Fusion (RRF)で統合
 - **PGVector**: PostgreSQL + pgvectorによる高速ベクトル検索
-- **PostgreSQL FTS**: `to_tsvector()` + `ts_rank()` による全文検索（AWS RDS/Aurora対応）
+- **BM25キーワード検索**: SudachiPy形態素解析によるインメモリBM25検索（日本語対応）
 - **専門用語クエリ拡張**: 定義・類義語・関連語を活用した検索最適化
 
 ### 専門用語処理
@@ -193,9 +193,9 @@ sequenceDiagram
     par ベクトル検索
         Ret->>VS: similarity_search()
         VS-->>Ret: ベクトル検索結果
-    and キーワード検索
-        Ret->>VS: full_text_search()
-        VS-->>Ret: FTS検索結果
+    and BM25キーワード検索
+        Ret->>Ret: BM25検索(SudachiPy)
+        Ret-->>Ret: BM25検索結果
     end
     Ret->>Ret: RRF統合
     Ret-->>RAG: 統合された文書
@@ -303,6 +303,10 @@ graph TB
 │       ├── helpers.py          # ヘルパー関数（cosine_similarityなど）
 │       ├── profiler.py         # パフォーマンス計測
 │       └── style.py            # UIスタイル
+├── scripts/
+│   ├── extract_terms.py        # 専門用語抽出CLI
+│   ├── fix_document_type.py    # メタデータtype修復スクリプト
+│   └── test_bm25_search.py     # BM25・ハイブリッド検索テスト
 ├── data/                       # データファイル
 ├── docs/                       # ドキュメント
 └── output/                     # 出力ファイル
@@ -360,7 +364,7 @@ langchain-community 0.3.x 以降で必要なスキーマ：
 | document | VARCHAR | ドキュメント本文 |
 | cmetadata | JSONB | メタデータ |
 | custom_id | VARCHAR | カスタムID |
-| tokenized_content | TEXT | トークン化済みコンテンツ（FTS用） |
+| tokenized_content | TEXT | トークン化済みコンテンツ（レガシー、BM25移行済み） |
 
 ```sql
 -- スキーマ確認

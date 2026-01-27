@@ -1,10 +1,12 @@
 import json
+import logging
 import re
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 from typing import List, Dict, Any, Optional, Tuple
 
 from langchain_community.vectorstores import PGVector
+from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
 from langchain_core.retrievers import BaseRetriever
 from langchain_core.callbacks import CallbackManagerForRetrieverRun
@@ -13,19 +15,24 @@ from langchain_core.runnables import RunnableConfig
 from .config import Config
 from .text_processor import JapaneseTextProcessor
 
+logger = logging.getLogger(__name__)
+
 class JapaneseHybridRetriever(BaseRetriever):
     """
-    A retriever that combines vector search and keyword search (FTS)
+    A retriever that combines vector search and BM25 keyword search
     with Reciprocal Rank Fusion (RRF) for hybrid search, optimized for
     Japanese language.
     """
     vector_store: PGVector
     connection_string: str
     config_params: Config
-    text_processor: JapaneseTextProcessor
+    text_processor: JapaneseTextProcessor = None
     search_type: str = "hybrid"
     engine: Optional[Engine] = None
-    
+    bm25_retriever: Optional[Any] = None
+    bm25_collection: Optional[str] = None
+    bm25_doc_count: int = 0
+
     def __init__(self, engine: Optional[Engine] = None, **kwargs):
         super().__init__(**kwargs)
         self.text_processor = JapaneseTextProcessor()
@@ -55,77 +62,86 @@ class JapaneseHybridRetriever(BaseRetriever):
             print(f"[HybridRetriever] vector search error: {exc}")
             return []
 
-    def _keyword_search(self, q: str, config: Optional[RunnableConfig] = None) -> List[Tuple[Document, float]]:
-        """Performs keyword-based search with Japanese tokenization support."""
-        res: List[Tuple[Document, float]] = []
-
-        # Check if engine is available
+    def _build_bm25_retriever(self) -> Optional[BM25Retriever]:
+        """BM25Retrieverを構築（キャッシュ付き）"""
         if not self.engine:
-            import logging
-            logger = logging.getLogger(__name__)
-            logger.warning("[HybridRetriever] No engine available for keyword search")
-            return []
+            logger.warning("[HybridRetriever] No engine available for BM25 search")
+            return None
 
-        normalized_query = self.text_processor.normalize_text(q)
-        is_japanese = self.text_processor.is_japanese(normalized_query)
+        collection = self.config_params.collection_name
 
         try:
             with self.engine.connect() as conn:
-                if is_japanese and self.config_params.enable_japanese_search:
-                    tokens = self.text_processor.tokenize(normalized_query)
-                    if not tokens: return []
+                # チャンク数を確認（キャッシュ判定用）
+                result = conn.execute(text(
+                    "SELECT COUNT(*) FROM document_chunks WHERE collection_name = :coll"
+                ), {"coll": collection})
+                doc_count = result.scalar() or 0
 
-                    # Filter tokens by minimum length
-                    filtered_tokens = [t for t in tokens[:5] if len(t) >= self.config_params.japanese_min_token_length]
-                    if not filtered_tokens: return []
+            # キャッシュが有効ならそのまま返す
+            if (self.bm25_retriever is not None
+                    and self.bm25_collection == collection
+                    and self.bm25_doc_count == doc_count):
+                return self.bm25_retriever
 
-                    # 記号を空白にして安全なクエリにする
-                    safe_tokens = []
-                    for t in filtered_tokens:
-                        cleaned = re.sub(r"[^\\wぁ-んァ-ヶ一-龠ー\\s]", " ", t)
-                        cleaned = cleaned.strip()
-                        if cleaned:
-                            safe_tokens.append(cleaned)
+            if doc_count == 0:
+                logger.warning(f"[BM25] No document chunks for collection: {collection}")
+                return None
 
-                    if not safe_tokens:
-                        return []
+            # document_chunksから全件取得
+            with self.engine.connect() as conn:
+                result = conn.execute(text(
+                    "SELECT chunk_id, content, metadata FROM document_chunks WHERE collection_name = :coll"
+                ), {"coll": collection})
+                rows = result.fetchall()
 
-                    # plainto_tsqueryで記号崩れを防ぐ（ORよりAND寄りになるが安全性優先）
-                    tsquery_str = " ".join(safe_tokens)
+            docs = []
+            for row in rows:
+                md = row.metadata if isinstance(row.metadata, dict) else json.loads(row.metadata or "{}")
+                md["chunk_id"] = row.chunk_id
+                docs.append(Document(page_content=row.content, metadata=md))
 
-                    sql = """
-                        SELECT chunk_id, content, metadata,
-                               ts_rank(to_tsvector('simple', tokenized_content), plainto_tsquery('simple', :tsquery)) AS score
-                        FROM document_chunks
-                        WHERE to_tsvector('simple', tokenized_content) @@ plainto_tsquery('simple', :tsquery)
-                              AND collection_name = :collection_name
-                        ORDER BY score DESC LIMIT :k;
-                    """
+            # SudachiPyトークン化をpreprocess_funcに渡す
+            tp = self.text_processor
 
-                    db_result = conn.execute(text(sql), {
-                        "tsquery": tsquery_str,
-                        "collection_name": self.config_params.collection_name,
-                        "k": self.config_params.keyword_search_k
-                    })
-                else:
-                    sql = f"""
-                        SELECT chunk_id, content, metadata, 
-                               ts_rank(to_tsvector('{self.config_params.fts_language}', content), plainto_tsquery('{self.config_params.fts_language}', :q)) AS score 
-                        FROM document_chunks 
-                        WHERE to_tsvector('{self.config_params.fts_language}', content) @@ plainto_tsquery('{self.config_params.fts_language}', :q) 
-                        AND collection_name = :collection_name 
-                        ORDER BY score DESC LIMIT :k;
-                    """
-                    db_result = conn.execute(text(sql), {"q": normalized_query, "k": self.config_params.keyword_search_k, "collection_name": self.config_params.collection_name})
-                
-                for row in db_result:
-                    md = row.metadata if isinstance(row.metadata, dict) else json.loads(row.metadata or "{}")
-                    res.append((Document(page_content=row.content, metadata=md), float(row.score)))
-                    
+            def tokenize_for_bm25(text: str) -> List[str]:
+                normalized = tp.normalize_text(text)
+                if tp.is_japanese(normalized):
+                    tokens = tp.tokenize(normalized)
+                    return [t for t in tokens if len(t) >= 2]
+                return normalized.split()
+
+            retriever = BM25Retriever.from_documents(
+                docs,
+                preprocess_func=tokenize_for_bm25,
+                k=self.config_params.keyword_search_k
+            )
+
+            # キャッシュ更新
+            self.bm25_retriever = retriever
+            self.bm25_collection = collection
+            self.bm25_doc_count = doc_count
+            logger.info(f"[BM25] Built index: {doc_count} chunks for collection '{collection}'")
+
+            return retriever
+
         except Exception as exc:
-            print(f"[HybridRetriever] keyword search error: {exc}")
+            logger.error(f"[BM25] Failed to build retriever: {exc}")
+            return None
+
+    def _keyword_search(self, q: str, config: Optional[RunnableConfig] = None) -> List[Tuple[Document, float]]:
+        """BM25によるキーワード検索"""
+        retriever = self._build_bm25_retriever()
+        if not retriever:
             return []
-        return res
+
+        try:
+            docs = retriever.invoke(q)
+            # BM25Retrieverはスコアを返さないので、順位ベースのスコアを付与
+            return [(doc, 1.0 / (i + 1)) for i, doc in enumerate(docs)]
+        except Exception as exc:
+            logger.error(f"[BM25] keyword search error: {exc}")
+            return []
 
     @staticmethod
     def _rrf_hybrid(rank: int, k: int = 60) -> float:

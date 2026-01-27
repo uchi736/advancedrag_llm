@@ -56,6 +56,15 @@ tornado==6.5.1
 tzlocal==5.3.1
 watchdog==6.0.0
 
+# Japanese text processing
+sudachipy==0.6.8
+sudachidict-core>=20240716
+rank_bm25>=0.2.2
+
+# Clustering for domain classification
+hdbscan>=0.8.29
+umap-learn>=0.5.3
+
 # Data processing
 numpy==1.26.2
 pandas==2.2.3

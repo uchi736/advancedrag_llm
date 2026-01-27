@@ -196,6 +196,7 @@ class IngestionHandler:
                     chunk.metadata["source"] = src
                     chunk.metadata["chunk_index"] = chunk_counter
                     chunk.metadata["is_parent"] = False
+                    chunk.metadata["type"] = "document"
                     chunk_counter += 1
                     all_chunks.append(chunk)
 

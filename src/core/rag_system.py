@@ -33,7 +33,7 @@ from langchain_community.vectorstores import PGVector
 from src.rag.config import Config
 from src.rag.text_processor import JapaneseTextProcessor
 from src.rag.term_extraction import JargonDictionaryManager  # 統合されたモジュールから
-from src.rag.retriever import JapaneseHybridRetriever
+from src.rag.retriever import JapaneseHybridRetriever, similarity_search_without_jargon
 from src.rag.ingestion import IngestionHandler
 from src.rag.sql_handler import SQLHandler
 from src.rag.evaluator import RAGEvaluator, EvaluationResults, EvaluationMetrics
@@ -544,6 +544,7 @@ class RAGSystem:
                     logger.info("langchain_pg_embedding table does not exist yet, skipping HNSW index creation")
             except Exception as e:
                 logger.warning(f"Could not create HNSW index: {e}")
+                conn.rollback()
 
             # スキーマ検証とマイグレーション
             self._validate_and_migrate_schema(conn)
@@ -810,13 +811,11 @@ class RAGSystem:
 
                     # HyDE-enhanced retrieval: use hypothetical document for vector search
                     if hyde_document and search_type in ("hybrid", "vector"):
-                        # Vector search with hyde_document
-                        vector_docs = self.vector_store.similarity_search(
-                            hyde_document,
-                            k=self.config.vector_search_k * 2
+                        vector_docs = similarity_search_without_jargon(
+                            engine=self.engine, embeddings=self.embeddings,
+                            query=hyde_document, collection_name=self.config.collection_name,
+                            k=self.config.vector_search_k,
                         )
-                        # Filter out jargon_term type
-                        vector_docs = [d for d in vector_docs if d.metadata.get("type") != "jargon_term"][:self.config.vector_search_k]
 
                         if search_type == "hybrid":
                             # Keyword search with original query

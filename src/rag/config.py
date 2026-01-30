@@ -170,6 +170,9 @@ class Config:
     stage2_batch_size: int = 50  # Batch size for Stage 2 technical term filtering
     max_concurrent_llm_calls: int = 20  # Max concurrent LLM calls (Windows select() limit workaround)
     enable_stage25_refinement: bool = True  # Stage 2.5 Self-Reflection ON/OFF
+    max_refinement_iterations: int = 3  # Stage 2.5 最大反復回数
+    reflection_batch_size_terms: int = 100  # Stage 2.5 反省バッチサイズ(terms)
+    reflection_batch_size_candidates: int = 50  # Stage 2.5 反省バッチサイズ(candidates)
 
     # Domain classification settings (Stage 4)
     stage4_domain_method: str = "llm"  # "llm" | "hdbscan" | "hybrid"

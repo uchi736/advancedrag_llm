@@ -17,6 +17,46 @@ from .text_processor import JapaneseTextProcessor
 
 logger = logging.getLogger(__name__)
 
+
+def similarity_search_without_jargon(
+    engine: Engine,
+    embeddings,
+    query: str,
+    collection_name: str,
+    k: int = 5,
+    with_score: bool = False,
+) -> list:
+    """SQLレベルでjargon_termを除外したベクトル検索。
+
+    Args:
+        with_score: Trueなら List[Tuple[Document, float]] を返す
+    """
+    query_embedding = embeddings.embed_query(query)
+    embedding_str = "[" + ",".join(str(x) for x in query_embedding) + "]"
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT e.document, e.cmetadata,
+                   e.embedding <=> :embedding ::vector AS distance
+            FROM langchain_pg_embedding e
+            JOIN langchain_pg_collection c ON e.collection_id = c.uuid
+            WHERE c.name = :collection
+              AND (e.cmetadata->>'type' IS NULL OR e.cmetadata->>'type' != 'jargon_term')
+            ORDER BY distance
+            LIMIT :k
+        """), {"embedding": embedding_str, "collection": collection_name, "k": k})
+        results = rows.fetchall()
+
+    docs = []
+    for r in results:
+        meta = r.cmetadata if isinstance(r.cmetadata, dict) else json.loads(r.cmetadata or "{}")
+        doc = Document(page_content=r.document, metadata=meta)
+        if with_score:
+            docs.append((doc, float(r.distance)))
+        else:
+            docs.append(doc)
+    return docs
+
+
 class JapaneseHybridRetriever(BaseRetriever):
     """
     A retriever that combines vector search and BM25 keyword search
@@ -44,20 +84,15 @@ class JapaneseHybridRetriever(BaseRetriever):
             return []
         try:
             search_k = self.config_params.vector_search_k
-
-            # フィルタなしでk*2件取得 → 手動でjargon_term除外 → k件
-            # (メタデータフィルタはtype未設定のドキュメントも除外してしまうため使わない)
-            if hasattr(self.vector_store, 'similarity_search_with_score'):
-                results = self.vector_store.similarity_search_with_score(q, k=search_k * 2)
-            elif hasattr(self.vector_store, 'vector_store'):
-                results = self.vector_store.vector_store.similarity_search_with_score(q, k=search_k * 2)
-            else:
-                return []
-
-            # 手動でjargon_termを除外
-            filtered = [(doc, score) for doc, score in results if doc.metadata.get('type') != 'jargon_term']
-            return filtered[:search_k]
-
+            embeddings = self.vector_store.embedding_function
+            return similarity_search_without_jargon(
+                engine=self.engine,
+                embeddings=embeddings,
+                query=q,
+                collection_name=self.config_params.collection_name,
+                k=search_k,
+                with_score=True,
+            )
         except Exception as exc:
             print(f"[HybridRetriever] vector search error: {exc}")
             return []

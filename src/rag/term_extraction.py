@@ -41,6 +41,8 @@ except ImportError:
     CLUSTERING_AVAILABLE = False
     TermClusteringAnalyzer = None
 
+from .retriever import similarity_search_without_jargon
+
 logger = logging.getLogger(__name__)
 
 
@@ -53,6 +55,7 @@ class ExtractedTerm(BaseModel):
     confidence: float = Field(default=1.0, description="信頼度スコア")
     domain: Optional[str] = Field(default=None, description="分野・ドメイン（例: 医療、工学、法律など）")
     rejection_reason: Optional[str] = Field(default=None, description="除外理由（除外された場合のみ）")
+    confidence_level: Optional[str] = Field(default="middle", description="確信度レベル（high/middle/low）")
 
 
 class ExtractedTermList(BaseModel):
@@ -817,10 +820,13 @@ class TermExtractor:
         term["synonyms"] = cleaned
         return term
 
-    async def _filter_technical_terms(self, candidates: List[Dict], output_dir: Optional[Path] = None) -> List[Dict]:
-        """候補から専門用語を選別（第2段階）- バッチ処理対応"""
+    async def _filter_technical_terms(self, candidates: List[Dict], output_dir: Optional[Path] = None, return_rejected: bool = False) -> List[Dict]:
+        """候補から専門用語を選別（第2段階）- バッチ処理対応
+
+        return_rejected=Trueの場合、(selected, rejected)のタプルを返す
+        """
         if not candidates:
-            return []
+            return ([], []) if return_rejected else []
 
         try:
             # バッチサイズを取得
@@ -953,10 +959,14 @@ class TermExtractor:
                     print(f"[OK] 未処理 {missing} 件をフォールバックで追加しました\n")
 
             logger.info(f"Technical term filtering: {len(output)} selected, {len(rejected_output)} rejected from {len(candidates)} candidates")
+            if return_rejected:
+                return output, rejected_output
             return output
 
         except Exception as e:
             logger.error(f"Technical term filtering failed: {e}")
+            if return_rejected:
+                return candidates, []
             return candidates  # エラー時は全候補を返す
 
     async def _generate_definitions_with_rag(self, technical_terms: List[Dict]) -> List[Dict]:
@@ -997,14 +1007,15 @@ class TermExtractor:
 
                 for attempt in range(max_retries):
                     try:
-                        # 定義生成用: 多めに取得 → jargon_term除外 → 上位5件
                         docs = []
-                        if self.vector_store:
-                            all_docs = self.vector_store.similarity_search(headword, k=20)
-                            docs = [d for d in all_docs if d.metadata.get('type') != 'jargon_term'][:5]
-                            logger.info(f"[Stage3 RAG] '{headword}': {len(all_docs)} total -> {len(docs)} document chunks")
+                        if self.engine and self.embeddings:
+                            docs = similarity_search_without_jargon(
+                                engine=self.engine, embeddings=self.embeddings,
+                                query=headword, collection_name=self.collection_name, k=5,
+                            )
+                            logger.info(f"[Stage3 RAG] '{headword}': {len(docs)} document chunks")
                         else:
-                            logger.warning(f"[Stage3 RAG] '{headword}': vector_store is None!")
+                            logger.warning(f"[Stage3 RAG] '{headword}': engine/embeddings not available")
 
                         if docs:
                             # コンテキストを結合（最大3000文字）
@@ -1057,11 +1068,12 @@ class TermExtractor:
                 # Override chain.ainvoke to use config for this call only
                 headword = term.get("headword", "")
                 if headword:
-                    # 多めに取得 → jargon_term除外 → 上位5件
                     docs = []
-                    if self.vector_store:
-                        all_docs = self.vector_store.similarity_search(headword, k=20)
-                        docs = [d for d in all_docs if d.metadata.get('type') != 'jargon_term'][:5]
+                    if self.engine and self.embeddings:
+                        docs = similarity_search_without_jargon(
+                            engine=self.engine, embeddings=self.embeddings,
+                            query=headword, collection_name=self.collection_name, k=5,
+                        )
 
                     if docs:
                         context = "\n\n".join([doc.page_content for doc in docs])[:3000]
@@ -1568,20 +1580,53 @@ class TermExtractor:
         return state
 
     async def _node_stage2_initial_filter(self, state: TermExtractionState) -> TermExtractionState:
-        """Stage 2: 初期選別ノード"""
+        """Stage 2: 初期選別ノード（確信度ベーストリアージ付き）"""
         logger.info("[Stage 2] Initial filtering...")
         print(f"[Stage 2] 専門用語を選別中...")
 
-        # バッチ処理で選別
-        technical_terms = await self._filter_technical_terms(state["candidates"], output_dir=state.get("output_dir"))
+        # バッチ処理で選別（rejected も取得）
+        selected, rejected = await self._filter_technical_terms(
+            state["candidates"], output_dir=state.get("output_dir"), return_rejected=True
+        )
 
-        state["technical_terms"] = technical_terms
+        # 確信度で3分割: high→スルーパス, middle→Stage2.5対象, low→即却下
+        high_terms = []
+        middle_terms = []
+        low_terms = []
+
+        for term in selected:
+            cl = term.get("confidence_level", "middle")
+            if cl == "high":
+                high_terms.append(term)
+            elif cl == "low":
+                low_terms.append(term)
+            else:  # middle or unknown
+                middle_terms.append(term)
+
+        # low確信度はrejected_termsへ
+        if "rejected_terms" not in state:
+            state["rejected_terms"] = []
+        for term in low_terms:
+            state["rejected_terms"].append({
+                **term,
+                "rejection_reason": "低確信度により自動除外（confidence_level=low）",
+            })
+
+        # Stage2で明示的にrejectedされたものも追加
+        for term in rejected:
+            state["rejected_terms"].append(term)
+
+        # technical_terms = high + middle（highはStage2.5スキップ対象としてマーク）
+        for term in high_terms:
+            term["skip_reflection"] = True
+        state["technical_terms"] = high_terms + middle_terms
+
         state["refinement_iteration"] = 0
         state["refinement_converged"] = False
         state["previous_list_hash"] = None
 
-        logger.info(f"Stage 2 complete: {len(technical_terms)} technical terms")
-        print(f"[OK] {len(technical_terms)}個の専門用語を選別しました\n")
+        logger.info(f"Stage 2 complete: {len(high_terms)} high, {len(middle_terms)} middle, {len(low_terms)} low (rejected)")
+        print(f"[OK] {len(selected)}個選別 → high: {len(high_terms)}個（スルーパス）, middle: {len(middle_terms)}個（反省対象）, low: {len(low_terms)}個（自動除外）\n")
 
         return state
 
@@ -1599,12 +1644,29 @@ class TermExtractor:
         batch_size_terms = getattr(self.config, 'reflection_batch_size_terms', 100)
         batch_size_candidates = getattr(self.config, 'reflection_batch_size_candidates', 50)
 
-        technical_terms = state["technical_terms"]
+        all_technical_terms = state["technical_terms"]
+        # high確信度はStage2.5の反省対象から除外
+        technical_terms = [t for t in all_technical_terms if not t.get("skip_reflection")]
+        high_terms = [t for t in all_technical_terms if t.get("skip_reflection")]
         candidates = state["candidates"]
+
+        reflection_history = state.get("reflection_history", [])
+
+        logger.info(f"[Stage 2.5] Reflecting on {len(technical_terms)} middle terms (skipping {len(high_terms)} high-confidence terms)")
+        if high_terms:
+            print(f"  （high確信度 {len(high_terms)}個はスキップ、{len(technical_terms)}個を反省対象）")
+
+        # middle対象が0件ならスキップ
+        if len(technical_terms) == 0:
+            logger.info("[Stage 2.5] No middle-confidence terms to reflect on, skipping")
+            print("  反省対象なし、Stage 2.5をスキップ")
+            return {
+                "refinement_confidence": 1.0,
+                "reflection_history": reflection_history + [{"issues_found": [], "suggested_actions": [], "skipped": True}],
+            }
 
         # 前回の反省
         previous_reflection = "初回の反省"
-        reflection_history = state.get("reflection_history", [])
         if reflection_history:
             prev = reflection_history[-1]
             previous_reflection = f"前回の問題点: {', '.join(prev.get('issues_found', []))}\n前回のアクション: {', '.join(prev.get('suggested_actions', []))}"
@@ -1775,7 +1837,11 @@ class TermExtractor:
         """Stage 2.5b: 改善実行ノード"""
         from .prompts import get_term_refinement_prompt
 
-        reflection = state["reflection_history"][-1]
+        reflection_history = state.get("reflection_history", [])
+        if not reflection_history:
+            logger.warning("[Stage 2.5] No reflection history found, skipping refinement")
+            return {"refinement_iteration": state.get("refinement_iteration", 0) + 1}
+        reflection = reflection_history[-1]
         refinement_iteration = state.get("refinement_iteration", 0)
         before_counts = {
             "terms": len(state.get("technical_terms", [])),
@@ -1790,7 +1856,7 @@ class TermExtractor:
         investigated_removed = 0  # Investigate処理での除外数
 
         # 1. Remove処理（既存）
-        if reflection["suggested_actions"] and not state["refinement_converged"]:
+        if reflection.get("suggested_actions") and not state.get("refinement_converged", False):
             logger.info("[Stage 2.5] Refining terms...")
             print(f"[Stage 2.5] 改善アクション実行中...")
 
@@ -1825,11 +1891,16 @@ class TermExtractor:
 
                     for action in actions:
                         if action.get("action") == "remove":
-                            term_name = action["term"]
+                            term_name = action.get("term")
+                            if not term_name:
+                                continue
                             term_obj = next((t for t in state["technical_terms"]
                                            if t["headword"] == term_name), None)
+                            if term_obj and term_obj.get("skip_reflection"):
+                                logger.debug(f"Skipping removal of high-confidence term: {term_name}")
+                                continue
                             if term_obj:
-                                state["technical_terms"].remove(term_obj)
+                                state["technical_terms"] = [t for t in state["technical_terms"] if t["headword"] != term_name]
                                 if "rejected_terms" not in state:
                                     state["rejected_terms"] = []
                                 state["rejected_terms"].append({
@@ -1841,9 +1912,14 @@ class TermExtractor:
 
                         elif action.get("action") == "investigate":
                             # investigate対象を収集（後でまとめてRAG再判定）
-                            term_name = action["term"]
+                            term_name = action.get("term")
+                            if not term_name:
+                                continue
                             term_obj = next((t for t in state["technical_terms"]
                                            if t["headword"] == term_name), None)
+                            if term_obj and term_obj.get("skip_reflection"):
+                                logger.debug(f"Skipping investigation of high-confidence term: {term_name}")
+                                continue
                             if term_obj:
                                 if "investigate_terms" not in state:
                                     state["investigate_terms"] = []
@@ -1888,13 +1964,14 @@ class TermExtractor:
                     logger.debug(f"Skipping duplicate missing term: {hw}")
                     continue
 
-                # ★ RAG検索で定義生成（フィルタなしで取得→手動除外）
-                definition = m.get("evidence", "")  # デフォルトはevidenceを使用
+                definition = m.get("evidence", "")
                 try:
                     docs = []
-                    if self.vector_store:
-                        all_docs = self.vector_store.similarity_search(hw, k=6)
-                        docs = [d for d in all_docs if d.metadata.get('type') != 'jargon_term'][:3]
+                    if self.engine and self.embeddings:
+                        docs = similarity_search_without_jargon(
+                            engine=self.engine, embeddings=self.embeddings,
+                            query=hw, collection_name=self.collection_name, k=3,
+                        )
 
                     if docs:
                         # 上位3件の文書から定義生成
@@ -1974,15 +2051,16 @@ class TermExtractor:
                 term_obj = next((t for t in state["technical_terms"]
                                if t["headword"] == hw), None)
                 if term_obj:
-                    state["technical_terms"].remove(term_obj)
+                    state["technical_terms"] = [t for t in state["technical_terms"] if t["headword"] != hw]
 
-                # RAG検索で定義を再生成（フィルタなしで取得→手動除外）
                 definition = inv_term.get("brief_definition", "")
                 try:
                     docs = []
-                    if self.vector_store:
-                        all_docs = self.vector_store.similarity_search(hw, k=6)
-                        docs = [d for d in all_docs if d.metadata.get('type') != 'jargon_term'][:3]
+                    if self.engine and self.embeddings:
+                        docs = similarity_search_without_jargon(
+                            engine=self.engine, embeddings=self.embeddings,
+                            query=hw, collection_name=self.collection_name, k=3,
+                        )
 
                     if docs:
                         context = "\n".join([d.page_content[:500] for d in docs[:3]])
@@ -2305,18 +2383,35 @@ async def run_extraction_pipeline(input_dir: Path, output_json: Path, config, ll
 
     # ファイルの検索
     supported_exts = ['.txt', '.md', '.pdf']
-    files = [p for ext in supported_exts for p in input_dir.glob(f"**/*{ext}")]
+    files = [p for ext in supported_exts for p in input_dir.glob(f"**/*{ext}")] if input_dir else []
 
-    if not files:
+    output_dir = output_json.parent
+
+    if files:
+        logger.info(f"Found {len(files)} files to process")
+        result = await extractor.extract_from_documents(files, output_dir=output_dir)
+        terms = result.get("terms", [])
+    elif pg_url and collection_name:
+        # DBフォールバック: document_chunksからテキスト取得
+        logger.info(f"No files found. Loading text from document_chunks (collection: {collection_name})...")
+        print(f"[INFO] DBからチャンクを取得中 (collection: {collection_name})...")
+        from sqlalchemy import create_engine, text as sa_text
+        engine = create_engine(pg_url)
+        with engine.connect() as conn:
+            rows = conn.execute(sa_text(
+                "SELECT content FROM document_chunks WHERE collection_name = :coll ORDER BY chunk_id"
+            ), {"coll": collection_name}).fetchall()
+        if not rows:
+            logger.error(f"No document chunks found for collection: {collection_name}")
+            print(f"[ERROR] コレクション '{collection_name}' にチャンクがありません")
+            return
+        combined_text = "\n\n".join(r.content for r in rows)
+        logger.info(f"Loaded {len(rows)} chunks ({len(combined_text)} chars) from DB")
+        print(f"[OK] {len(rows)}チャンク取得 ({len(combined_text)}文字)")
+        terms = await extractor._extract_terms(combined_text, output_dir=output_dir)
+    else:
         logger.error(f"No supported files found in {input_dir}")
         return
-
-    logger.info(f"Found {len(files)} files to process")
-
-    # 用語抽出（output_dirを渡す）
-    output_dir = output_json.parent
-    result = await extractor.extract_from_documents(files, output_dir=output_dir)
-    terms = result.get("terms", [])
 
     # JSONファイルに保存
     output_json.parent.mkdir(parents=True, exist_ok=True)

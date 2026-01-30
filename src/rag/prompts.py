@@ -6,6 +6,26 @@ This module contains all prompt templates used in the RAG system.
 from langchain_core.prompts import ChatPromptTemplate
 
 # RAG-related prompts
+ENTITY_EXTRACTION = """あなたはエンティティ抽出の専門家です。以下の質問を分析し、重要なエンティティ（専門用語、固有名詞、技術概念）を抽出してください。
+
+【抽出対象】
+- 専門用語・技術用語
+- 固有名詞（製品名、組織名、規格名）
+- 技術概念・手法名
+- 略語（アルファベット3文字以上）
+
+【除外対象】
+- 一般的な日常用語
+- 助詞・助動詞・接続詞
+- 数字のみ
+
+【出力形式】
+抽出したエンティティを改行区切りで出力してください（最大{{max_entities}}個）。
+
+質問: {question}
+
+抽出されたエンティティ:"""
+
 JARGON_EXTRACTION = """あなたは専門用語抽出の専門家です。以下の質問を分析し、専門用語や技術用語を抽出してください。
 
 【抽出対象】
@@ -238,12 +258,19 @@ TECHNICAL_TERM_FILTER_SYSTEM_PROMPT = """抽出された候補から、本当に
 - 一般的な動詞・形容詞（brief_definitionから専門性が感じられない）
 - 広すぎる概念（brief_definitionから特定の専門分野に絞られない）
 
+**確信度レベル（confidence_level）**:
+selectedに含める各用語には、以下の確信度レベルを必ず付与してください:
+- **"high"**: 明確に専門用語である（定義から専門性が明白、業界標準の用語）
+- **"middle"**: 専門用語の可能性が高いが判断が微妙（文脈依存、複数分野にまたがるなど）
+- **"low"**: 専門用語としては弱いが完全な一般語とも言い切れない（除外すべきか迷うもの）
+
 **重要**: brief_definitionの内容を考慮せずに用語名だけで判断しないでください！
 例えば「学習」は一般語に見えますが、brief_definitionが「機械学習アルゴリズムの訓練プロセス」であれば専門用語として扱うべきです。
 
 **必須要件（欠落禁止）**:
 - 入力されたすべての候補を必ず分類し、1つの候補につき1回だけ selected または rejected のどちらかに含めること（抜け・重複は禁止）
-- 判定に迷うものは rejected として rejection_reason を付与すること
+- selectedの各用語には confidence_level ("high", "middle", "low") を必ず付与すること
+- 判定に迷うものは selected に含めて confidence_level を "low" にするか、rejected として rejection_reason を付与すること
 - selected の件数 + rejected の件数 = 入力候補の件数 になること
 
 出力形式:

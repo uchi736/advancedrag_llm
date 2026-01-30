@@ -451,3 +451,49 @@ streamlit run app.py
 2. CSVファイルで評価データをアップロード
 3. バルククエリを実行
 4. Recall、Precision、MRRなどの指標を確認
+
+## CLIツール
+
+大量のドキュメントを処理する場合、UIよりCLIが効率的です。
+
+### ドキュメントインジェスト
+
+```bash
+# PDFファイルを指定してインジェスト
+python scripts/ingest_documents.py path/to/file.pdf
+
+# ディレクトリ内のPDFを一括処理
+python scripts/ingest_documents.py --dir path/to/pdf_dir
+
+# コレクション名を指定
+python scripts/ingest_documents.py --collection my_collection path/to/file.pdf
+```
+
+### 専門用語抽出
+
+```bash
+# 基本（DBのdocument_chunksテーブルから抽出）
+python scripts/extract_terms.py --collection documents --output output/terms.json
+
+# PDFから直接抽出
+python scripts/extract_terms.py --input path/to/pdfs --output output/terms.json
+
+# Stage 2.5（自己反省ループ）を無効化して高速化
+python scripts/extract_terms.py --collection documents --output output/terms.json --no-stage25
+
+# 最大反復回数を指定（デフォルト3回）
+python scripts/extract_terms.py --collection documents --max-iterations 5
+
+# ドメイン分類方法を指定（embedding or llm）
+python scripts/extract_terms.py --collection documents --domain-method llm
+```
+
+### その他のユーティリティ
+
+```bash
+# メタデータtype修復（NULL → 'document'）
+python scripts/fix_document_type.py
+
+# BM25・ハイブリッド検索テスト
+python scripts/test_bm25_search.py
+```

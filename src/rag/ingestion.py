@@ -59,19 +59,23 @@ class IngestionHandler:
         return self._chunk_documents_standard(docs)
 
     def _chunk_documents_standard(self, docs: List[Document]) -> List[Document]:
+        # H2のみで分割（H1はメタデータ化、H3以下はH2チャンク内に含む）
         headers_to_split_on = [
-            ("#", "Header 1"),
             ("##", "Header 2"),
-            ("###", "Header 3"),
-            ("####", "Header 4"),
         ]
         markdown_splitter = MarkdownHeaderTextSplitter(headers_to_split_on=headers_to_split_on)
 
-        # Fallback splitter for content without headers
+        # 日本語対応セパレータでの再帰分割（chunk_size超過時）
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=self.config.chunk_size,
-            chunk_overlap=self.config.chunk_overlap
+            chunk_overlap=self.config.chunk_overlap,
+            separators=["\n\n", "\n", "。", "、", " ", ""]
         )
+
+        def extract_h1_title(content: str) -> str:
+            """文書からH1タイトルを抽出"""
+            match = re.match(r'^#\s+(.+?)(?:\n|$)', content.strip())
+            return match.group(1).strip() if match else ""
 
         def normalize_header_line(line: str) -> str:
             """Normalize Markdown header spacing for comparison."""
@@ -141,6 +145,9 @@ class IngestionHandler:
                 # Add space after header markers if missing
                 normalized_content = re.sub(r'(^#{1,6})([^# \n])', r'\1 \2', normalized_content, flags=re.MULTILINE)
 
+                # H1タイトルを抽出（全チャンクのメタデータに付与）
+                document_title = extract_h1_title(normalized_content)
+
                 # Split by markdown headers
                 md_header_splits = markdown_splitter.split_text(normalized_content)
 
@@ -197,6 +204,17 @@ class IngestionHandler:
                     chunk.metadata["chunk_index"] = chunk_counter
                     chunk.metadata["is_parent"] = False
                     chunk.metadata["type"] = "document"
+                    # H1タイトルをメタデータに追加
+                    if document_title:
+                        chunk.metadata["document_title"] = document_title
+                    # ブレッドクラム形式のheading_pathを生成
+                    section_title = chunk.metadata.get("Header 2", "")
+                    if document_title and section_title:
+                        chunk.metadata["heading_path"] = f"{document_title} > {section_title}"
+                    elif document_title:
+                        chunk.metadata["heading_path"] = document_title
+                    elif section_title:
+                        chunk.metadata["heading_path"] = section_title
                     chunk_counter += 1
                     all_chunks.append(chunk)
 

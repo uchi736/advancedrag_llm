@@ -1753,20 +1753,17 @@ class TermExtractor:
         avg_confidence = sum(confidence_scores) / len(confidence_scores) if confidence_scores else 0.5
         should_continue = avg_confidence < 0.9 or len(unique_issues) > 0 or len(unique_missing) > 0
 
-        # missing_termsの動的制限: 用語数の10%（最低5、最大30）
-        max_missing = max(5, min(30, len(technical_terms) // 10))
-
         reflection = {
             "issues_found": unique_issues,
             "confidence_in_current_list": avg_confidence,
             "suggested_actions": unique_actions,
             "should_continue": should_continue,
             "reasoning": " | ".join(all_reasonings) if all_reasonings else "バッチ処理完了",
-            "missing_terms": unique_missing[:max_missing]
+            "missing_terms": unique_missing  # 制限なし: LLMが検出した全ての漏れ用語を処理
         }
 
         logger.info(f"Aggregated reflection: issues={len(unique_issues)}, "
-                   f"actions={len(unique_actions)}, missing={len(unique_missing)} (max={max_missing}), "
+                   f"actions={len(unique_actions)}, missing={len(unique_missing)}, "
                    f"avg_confidence={avg_confidence:.2f}")
 
         # デバッグ: パース後のreflection構造を確認（特にmissing_terms）
@@ -1940,7 +1937,7 @@ class TermExtractor:
         missing_terms = reflection.get("missing_terms", [])
         if missing_terms:
             logger.info(f"[Stage 2.5] Processing {len(missing_terms)} missing terms with RAG...")
-            print(f"[Stage 2.5] 漏れ用語を追加中 ({len(missing_terms)}個、RAG定義生成)...")
+            print(f"[Stage 2.5] 漏れ用語を処理中 ({len(missing_terms)}個)...")
 
             # デバッグ: missing_termsの構造を確認
             logger.debug(f"missing_terms structure: {type(missing_terms)}, first item: {missing_terms[0] if missing_terms else 'empty'}")
@@ -1952,6 +1949,7 @@ class TermExtractor:
 
             # missing → candidates形式に変換 + RAG定義生成
             new_candidates = []
+            duplicate_count = 0  # 重複スキップ数をカウント
             for m in missing_terms:
                 # JsonOutputParserは常にdictを返すため、dict前提で処理
                 term_str = m.get("term", "")
@@ -1962,6 +1960,7 @@ class TermExtractor:
                 # 重複チェック
                 if self._is_duplicate(hw, state):
                     logger.debug(f"Skipping duplicate missing term: {hw}")
+                    duplicate_count += 1
                     continue
 
                 definition = m.get("evidence", "")
@@ -1995,18 +1994,18 @@ class TermExtractor:
                 logger.debug(f"Added missing term candidate: {hw} (definition: {definition[:50]}...)")
 
             if new_candidates:
-                logger.info(f"Filtered {len(new_candidates)} unique missing terms for Stage2 incremental filtering")
+                logger.info(f"Filtered {len(new_candidates)} unique missing terms for Stage2 incremental filtering (skipped {duplicate_count} duplicates)")
+                print(f"  → 重複スキップ: {duplicate_count}個、Stage2判定: {len(new_candidates)}個")
 
                 # デバッグ: Stage2に渡す候補のbrief_definitionを確認
                 for c in new_candidates:
                     logger.info(f"[Stage2.5 Input] {c.get('headword')}: brief_definition='{c.get('brief_definition', '')[:80]}...'")
-                    print(f"  → Stage2判定: {c.get('headword')} | 定義: {c.get('brief_definition', '')[:60]}...")
+                    print(f"    判定対象: {c.get('headword')} | 定義: {c.get('brief_definition', '')[:60]}...")
 
                 # 増分Stage2実行（全候補ではなく新規のみ）
                 selected = await self._filter_technical_terms(new_candidates)
                 if not selected:
                     logger.warning("Stage2 incremental filtering returned 0 terms (all rejected or parse failure).")
-                    print(f"[WARN] Stage2 増分フィルタで追加0件（除外またはパース失敗の可能性）")
 
                 # 選択されたものをtechnical_termsにマージ
                 selected_headwords = {t.get("headword") for t in selected}
@@ -2027,9 +2026,13 @@ class TermExtractor:
                         logger.debug(f"Rejected missing term: {cand['headword']}")
 
                 added_count = len(selected)
-                missing_rejected_count = len(new_candidates) - added_count
-                logger.info(f"Added {added_count} terms from missing candidates (rejected {missing_rejected_count})")
-                print(f"  Missing: {added_count}個追加（{len(new_candidates)}個中{missing_rejected_count}個却下）")
+                stage2_rejected = len(new_candidates) - added_count
+                logger.info(f"Added {added_count} terms from missing candidates (rejected {stage2_rejected})")
+                print(f"  → 結果: 追加{added_count}個、Stage2却下{stage2_rejected}個")
+            else:
+                # 全て重複でスキップされた場合
+                logger.info(f"All {duplicate_count} missing terms were duplicates, nothing to add")
+                print(f"  → 全て重複: {duplicate_count}個スキップ（既に処理済み）")
 
         # 3. Investigate処理（RAG再定義 → 増分Stage2フィルタで再判定）
         investigate_terms = state.get("investigate_terms", [])

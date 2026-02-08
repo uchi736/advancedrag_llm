@@ -1174,34 +1174,51 @@ class TermExtractor:
 
             try:
                 parsed = self.term_group_parser.parse(result_text)
-                groups = getattr(parsed, "groups", []) or []
-
-                representative_terms = []
-                for group in groups:
-                    g = group if isinstance(group, dict) else group.dict()
-                    term_dict = {
-                        "headword": g.get("headword", ""),
-                        "synonyms": g.get("synonyms", []),
-                        "definition": g.get("definition", ""),
-                        "domain": g.get("domain", "一般")
-                    }
-                    representative_terms.append(term_dict)
-
-                logger.info(f"Grouped {len(terms)} terms into {len(representative_terms)} representative terms")
-                representative_terms = [self._clean_synonyms(t) for t in representative_terms]
-                if not representative_terms:
-                    logger.warning("Term grouping returned empty list; keeping original terms")
-                    return terms
-                return representative_terms
-
+                # JsonOutputParser は dict を返す場合がある
+                if isinstance(parsed, dict):
+                    groups = parsed.get("groups", []) or []
+                else:
+                    groups = getattr(parsed, "groups", []) or []
+                # 辞書が直接リストで返された場合（bare array parse結果）
+                if isinstance(parsed, list):
+                    groups = parsed
             except Exception as e:
-                logger.error(f"Failed to parse term grouping result: {e}")
-                logger.error(f"Result text (first 1000 chars): {result_text[:1000]}")
-                logger.error(f"Result text (last 500 chars): {result_text[-500:]}")
-                print(f"[WARN] バッチのグループ化に失敗しました。\n")
-                print(f"   JSONパースエラー: {e}\n")
-                print(f"   LLM出力の最初: {result_text[:200]}...\n")
+                logger.warning(f"Primary parser failed: {e}")
+                groups = []
+                # フォールバック: bare array [...] → {"groups": [...]} 変換
+                try:
+                    import re
+                    json_match = re.search(r'\[.*\]', result_text, re.DOTALL)
+                    if json_match:
+                        raw_groups = json.loads(json_match.group(0))
+                        if isinstance(raw_groups, list) and raw_groups:
+                            groups = raw_groups
+                            logger.info(f"Parsed {len(groups)} groups from bare JSON array (fallback)")
+                except Exception as e2:
+                    logger.error(f"Fallback parse also failed: {e2}")
+                    logger.error(f"Result text (first 1000 chars): {result_text[:1000]}")
+
+            if not groups:
+                logger.warning("Term grouping returned empty list; keeping original terms")
                 return terms
+
+            representative_terms = []
+            for group in groups:
+                g = group if isinstance(group, dict) else group.dict()
+                term_dict = {
+                    "headword": g.get("headword", ""),
+                    "synonyms": g.get("synonyms", []),
+                    "definition": g.get("definition", ""),
+                    "domain": g.get("domain", "一般")
+                }
+                representative_terms.append(term_dict)
+
+            logger.info(f"Grouped {len(terms)} terms into {len(representative_terms)} representative terms")
+            representative_terms = [self._clean_synonyms(t) for t in representative_terms]
+            if not representative_terms:
+                logger.warning("Term grouping returned empty list after cleaning; keeping original terms")
+                return terms
+            return representative_terms
 
         except Exception as e:
             logger.error(f"Batch grouping failed: {e}")

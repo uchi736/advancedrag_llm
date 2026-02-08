@@ -316,27 +316,29 @@ TERM_SYNONYM_GROUPING_SYSTEM_PROMPT = """専門用語リストから、同義語
 - 複数の分野にまたがる場合は最も関連が強い分野を選択
 - 一般的すぎる用語は「一般」とする
 
-出力形式（JSON配列）:
-[
-  {{
-    "headword": "機械学習",           // 代表語（日本語優先）
-    "synonyms": ["Machine Learning", "ML"],  // 同義語リスト
-    "definition": "...",               // 定義（代表語の定義を採用）
-    "domain": "情報技術"              // 分野（必須）
-  }},
-  {{
-    "headword": "深層学習",
-    "synonyms": ["Deep Learning", "DL"],
-    "definition": "...",
-    "domain": "情報技術"
-  }},
-  {{
-    "headword": "熱交換器",
-    "synonyms": ["ヒートエクスチェンジャー"],
-    "definition": "...",
-    "domain": "工学"
-  }}
-]
+出力形式（JSONオブジェクト）:
+{{
+  "groups": [
+    {{
+      "headword": "機械学習",
+      "synonyms": ["Machine Learning", "ML"],
+      "definition": "...",
+      "domain": "情報技術"
+    }},
+    {{
+      "headword": "深層学習",
+      "synonyms": ["Deep Learning", "DL"],
+      "definition": "...",
+      "domain": "情報技術"
+    }},
+    {{
+      "headword": "熱交換器",
+      "synonyms": ["ヒートエクスチェンジャー"],
+      "definition": "...",
+      "domain": "工学"
+    }}
+  ]
+}}
 
 注意:
 - JSONは完全な形式で出力すること

@@ -1434,8 +1434,14 @@ class TermExtractor:
         logger.info(f"Saved {saved_count} terms to database")
         return saved_count
 
-    def _is_duplicate(self, headword: str, state: TermExtractionState) -> bool:
-        """既存候補/専門用語/除外済み用語との重複チェック"""
+    def _is_duplicate(self, headword: str, state: TermExtractionState,
+                      skip_rejected_headwords: set = None) -> bool:
+        """既存候補/専門用語/除外済み用語との重複チェック
+
+        Args:
+            skip_rejected_headwords: rejected_termsチェックから除外する用語名のセット
+                （同一反復内でRemoveされた用語をMissing処理で再追加可能にするため）
+        """
         if not headword:
             return True
 
@@ -1454,6 +1460,8 @@ class TermExtractor:
         # rejected_termsとの重複チェック（Stage2.5で一度却下された用語を再度拾わない）
         rejected = state.get("rejected_terms", [])
         rejected_keys = {r.get("headword", "").lower().strip() for r in rejected}
+        if skip_rejected_headwords:
+            rejected_keys -= {s.lower().strip() for s in skip_rejected_headwords}
         if key in rejected_keys:
             return True
 
@@ -1851,6 +1859,7 @@ class TermExtractor:
         missing_rejected_count = 0  # Missing処理での却下数
         investigated_kept = 0     # Investigate処理での保持数
         investigated_removed = 0  # Investigate処理での除外数
+        just_removed_headwords = set()  # 同一反復内でRemoveされた用語名（Missing処理の重複チェック除外用）
 
         # 1. Remove処理（既存）
         if reflection.get("suggested_actions") and not state.get("refinement_converged", False):
@@ -1886,8 +1895,16 @@ class TermExtractor:
                 try:
                     actions = json.loads(json_match.group(0))
 
+                    # Remove上限: middle用語の半分（最低3個）で全滅を防止
+                    middle_count = len([t for t in state["technical_terms"] if not t.get("skip_reflection")])
+                    remove_limit = max(3, middle_count // 2)
+
                     for action in actions:
                         if action.get("action") == "remove":
+                            if direct_removed_count >= remove_limit:
+                                logger.warning(f"Remove limit reached ({remove_limit}/{middle_count}), deferring remaining to next iteration")
+                                print(f"  [WARN] 削除上限に到達（{remove_limit}個）、残りは次回判定")
+                                break
                             term_name = action.get("term")
                             if not term_name:
                                 continue
@@ -1906,6 +1923,7 @@ class TermExtractor:
                                     "rejected_at_stage25": state.get("refinement_iteration", 0)
                                 })
                                 direct_removed_count += 1
+                                just_removed_headwords.add(term_name)
 
                         elif action.get("action") == "investigate":
                             # investigate対象を収集（後でまとめてRAG再判定）
@@ -1957,8 +1975,8 @@ class TermExtractor:
                 if not hw:
                     continue
 
-                # 重複チェック
-                if self._is_duplicate(hw, state):
+                # 重複チェック（同一反復でRemoveされた用語は除外しない→再追加を許可）
+                if self._is_duplicate(hw, state, skip_rejected_headwords=just_removed_headwords):
                     logger.debug(f"Skipping duplicate missing term: {hw}")
                     duplicate_count += 1
                     continue
@@ -2026,9 +2044,9 @@ class TermExtractor:
                         logger.debug(f"Rejected missing term: {cand['headword']}")
 
                 added_count = len(selected)
-                stage2_rejected = len(new_candidates) - added_count
-                logger.info(f"Added {added_count} terms from missing candidates (rejected {stage2_rejected})")
-                print(f"  → 結果: 追加{added_count}個、Stage2却下{stage2_rejected}個")
+                missing_rejected_count = len(new_candidates) - added_count
+                logger.info(f"Added {added_count} terms from missing candidates (rejected {missing_rejected_count})")
+                print(f"  → 結果: 追加{added_count}個、Stage2却下{missing_rejected_count}個")
             else:
                 # 全て重複でスキップされた場合
                 logger.info(f"All {duplicate_count} missing terms were duplicates, nothing to add")

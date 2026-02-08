@@ -476,10 +476,11 @@ SELF_REFLECTION_SYSTEM_PROMPT = """あなたは専門用語抽出の品質管理
 ## missing_terms の指摘基準
 
 候補リストを参照し、以下に該当する用語を missing_terms として指摘してください:
-- 専門性が高いと判断されるが、現在のリストに含まれていない用語
+- 専門性が高いと判断されるが、**現在の専門用語リストに含まれていない**用語
 - 定義や文脈から判断して、専門用語として扱うべき用語
-- **最大5個まで**（優先度の高いものから）
-- **重要**: 「既に却下済みの用語」に含まれる用語は絶対に指摘しないこと
+- 優先度の高いものから指摘すること
+- **【禁止】現在の専門用語リストに既に含まれている用語を missing_terms に入れないこと**
+- **【禁止】「既に却下済みの用語」に含まれる用語を missing_terms に入れないこと**
 
 注意:
 - 問題がなく品質が高ければ confidence: 0.9以上、should_continue: false を返す
@@ -490,8 +491,11 @@ SELF_REFLECTION_SYSTEM_PROMPT = """あなたは専門用語抽出の品質管理
 - missing_terms は evidence（根拠）を必ず記載すること
 - 「既に却下済みの用語」は過去のフィルタで除外された用語なので、再度指摘しても無駄"""
 
-SELF_REFLECTION_USER_PROMPT = """現在の専門用語リスト（{num_terms}個）:
+SELF_REFLECTION_USER_PROMPT = """現在の専門用語リスト・反省対象（{num_terms}個）:
 {terms_json}
+
+確定済み用語（高確信度のため反省対象外。missing_termsに含めないこと）:
+{high_terms_list}
 
 候補リスト（参考）（{num_candidates}個の候補から選別済み）:
 {candidates_sample}
@@ -505,7 +509,7 @@ SELF_REFLECTION_USER_PROMPT = """現在の専門用語リスト（{num_terms}個
 ---
 
 上記を分析し、JSON形式で評価してください。
-※「既に却下済みの用語」に含まれる用語は、過去に検討済みで除外されたものです。これらを再度missing_termsとして指摘しないでください。"""
+※「確定済み用語」と「既に却下済みの用語」は missing_terms に含めないでください。"""
 
 TERM_REFINEMENT_SYSTEM_PROMPT = """前回の反省で指摘された問題点に基づき、各専門用語について適切なアクションを決定してください。
 
@@ -562,3 +566,59 @@ def get_term_refinement_prompt():
         ("system", TERM_REFINEMENT_SYSTEM_PROMPT),
         ("user", TERM_REFINEMENT_USER_PROMPT)
     ])
+
+
+# ========== Answer Evaluation Prompts (LLM as a Judge) ==========
+
+FAITHFULNESS_EVALUATION_PROMPT = """あなたは回答品質評価の専門家です。
+回答が提供されたコンテキスト（検索結果）に忠実かどうかを評価してください。
+
+【評価基準】
+- 1.0: 回答内のすべての主張がコンテキストに基づいている（幻覚なし）
+- 0.5: 回答の一部はコンテキストに基づいているが、一部は根拠がない
+- 0.0: 回答の大部分がコンテキストに基づいていない、または完全に捏造されている
+
+【質問】
+{question}
+
+【コンテキスト（検索結果）】
+{context}
+
+【評価対象の回答】
+{answer}
+
+【出力形式】
+以下のJSON形式で出力してください:
+{{"score": <0, 0.5, または 1 のいずれか>, "reasoning": "<スコアの根拠を日本語で簡潔に説明>"}}
+
+評価結果:"""
+
+RELEVANCE_EVALUATION_PROMPT = """あなたは回答品質評価の専門家です。
+回答が質問に対して適切に答えているかを評価してください。
+
+【評価基準】
+- 1.0: 回答が質問に完全に答えており、適切で有用な情報を提供している
+- 0.5: 回答が質問に部分的に答えているが、不完全または的外れな部分がある
+- 0.0: 回答が質問に答えていない、または全く関係のない内容である
+
+【質問】
+{question}
+
+【評価対象の回答】
+{answer}
+
+【出力形式】
+以下のJSON形式で出力してください:
+{{"score": <0, 0.5, または 1 のいずれか>, "reasoning": "<スコアの根拠を日本語で簡潔に説明>"}}
+
+評価結果:"""
+
+
+def get_faithfulness_evaluation_prompt():
+    """回答の忠実性評価プロンプト（LLM as a Judge）"""
+    return ChatPromptTemplate.from_template(FAITHFULNESS_EVALUATION_PROMPT)
+
+
+def get_relevance_evaluation_prompt():
+    """回答の関連性評価プロンプト（LLM as a Judge）"""
+    return ChatPromptTemplate.from_template(RELEVANCE_EVALUATION_PROMPT)

@@ -1722,6 +1722,10 @@ class TermExtractor:
             if rejected_headwords:
                 logger.debug(f"Passing {len(rejected_headwords)} rejected terms to LLM: {rejected_headwords[:5]}...")
 
+            # high確信度用語リストを作成（LLMがmissing_termsとして指摘しないように）
+            high_headwords = [t.get("headword", "") for t in high_terms if t.get("headword")]
+            high_terms_list = ", ".join(high_headwords) if high_headwords else "（なし）"
+
             try:
                 batch_reflection = await chain.ainvoke({
                     "num_terms": len(technical_terms),
@@ -1729,6 +1733,7 @@ class TermExtractor:
                     "num_candidates": len(candidates),
                     "candidates_sample": candidates_sample,
                     "rejected_terms_list": rejected_terms_list,
+                    "high_terms_list": high_terms_list,
                     "previous_reflection": previous_reflection
                 })
 

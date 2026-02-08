@@ -1454,6 +1454,8 @@ class TermExtractor:
 
         # 候補リストとの重複チェック
         existing_candidates = {c.get("headword", "").lower().strip() for c in state["candidates"]}
+        if skip_rejected_headwords:
+            existing_candidates -= {s.lower().strip() for s in skip_rejected_headwords}
         if key in existing_candidates:
             return True
 
